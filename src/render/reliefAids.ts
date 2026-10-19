@@ -141,8 +141,8 @@ export function createReliefArrows(surfaceColorAt: (z: number) => number): Relie
         side.crossVectors(down, normal);
 
         const t = Math.min(1, slope / ARROW_FULL_SLOPE_DEG);
-        const length = 0.7 + 1.1 * t;
-        const width = 0.5 + 0.3 * t;
+        const length = 0.5 + 0.8 * t;
+        const width = 0.35 + 0.2 * t;
         matrix.makeBasis(down.clone().multiplyScalar(length), normal, side.clone().multiplyScalar(width));
         matrix.setPosition(
           x + n.x * ARROW_LIFT,
