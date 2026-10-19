@@ -10,6 +10,7 @@ import {
   type SimConfig,
 } from '../src/physics/simulation';
 import { SURFACES } from '../src/physics/surfaces';
+import { FLAT_TERRAIN } from '../src/world/terrain';
 import {
   ACCURACY_WINDOW,
   FALL_DURATION,
@@ -36,7 +37,7 @@ import type { BallState, CelestialBodyId, ShotInput, SurfaceId, Vec3, Wind } fro
 const NO_WIND: Wind = { speed: 0, headingDeg: 0 };
 
 function configFor(bodyId: CelestialBodyId, wind: Wind = NO_WIND): SimConfig {
-  return { ball: BALL_SPEC, body: CELESTIAL_BODIES[bodyId], wind, surfaceAt: () => SURFACES.fairway };
+  return { ball: BALL_SPEC, body: CELESTIAL_BODIES[bodyId], wind, surfaceAt: () => SURFACES.fairway, terrain: FLAT_TERRAIN };
 }
 
 // Misma gravedad que el cuerpo dado pero sin atmósfera.
@@ -46,6 +47,7 @@ function airlessConfigFor(bodyId: CelestialBodyId, wind: Wind = NO_WIND): SimCon
     body: { ...CELESTIAL_BODIES[bodyId], airDensity: 0 },
     wind,
     surfaceAt: () => SURFACES.fairway,
+    terrain: FLAT_TERRAIN,
   };
 }
 
@@ -455,21 +457,21 @@ describe('detección de contacto con el suelo', () => {
   });
 
   it('un rebote que vuelve a subir cuenta como contacto', () => {
-    expect(isGroundContact(state(-5), state(3))).toBe(true);
+    expect(isGroundContact(state(-5), state(3), FLAT_TERRAIN)).toBe(true);
   });
 
   it('el paso directo de vuelo a rodadura cuenta como contacto', () => {
-    expect(isGroundContact(state(-0.2), state(0, 'rolling'))).toBe(true);
+    expect(isGroundContact(state(-0.2), state(0, 'rolling'), FLAT_TERRAIN)).toBe(true);
   });
 
   it('seguir en el aire no cuenta como contacto', () => {
-    expect(isGroundContact(state(5), state(4))).toBe(false);
-    expect(isGroundContact(state(-5), state(-6))).toBe(false);
+    expect(isGroundContact(state(5), state(4), FLAT_TERRAIN)).toBe(false);
+    expect(isGroundContact(state(-5), state(-6), FLAT_TERRAIN)).toBe(false);
   });
 
   it('rodar o estar detenido no cuenta como contacto', () => {
-    expect(isGroundContact(state(0, 'rolling'), state(0, 'rolling'))).toBe(false);
-    expect(isGroundContact(state(0, 'rolling'), state(0, 'stopped'))).toBe(false);
+    expect(isGroundContact(state(0, 'rolling'), state(0, 'rolling'), FLAT_TERRAIN)).toBe(false);
+    expect(isGroundContact(state(0, 'rolling'), state(0, 'stopped'), FLAT_TERRAIN)).toBe(false);
   });
 
   it('un tiro completo registra tantos contactos como rebotes', () => {

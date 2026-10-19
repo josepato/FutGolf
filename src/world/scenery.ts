@@ -1,7 +1,10 @@
 import * as THREE from 'three';
+import type { Terrain } from '../physics/types';
+import { FLAT_TERRAIN } from './terrain';
 
 // Escenografía puramente visual: sirve para orientarse al girar el rumbo. No tiene
-// efecto en la física (los árboles y demás no colisionan; los obstáculos son del SPEC 03).
+// efecto en la física (los árboles y demás no colisionan; los obstáculos son del SPEC 04).
+// Todo se asienta sobre la altura del terreno; `setTerrain` lo recoloca al cambiar de terreno.
 
 export const HORIZON_COLOR = 0xcfe6f5;
 const ZENITH_COLOR = 0x4f9fe0;
@@ -22,7 +25,11 @@ function mulberry32(seed: number): () => number {
 // Corredor de juego del campo de prueba: ahí no se plantan árboles.
 const inPlayCorridor = (x: number, z: number): boolean => Math.abs(x) < 60 && z < 100 && z > -340;
 
-export function createScenery(scene: THREE.Scene): void {
+export interface Scenery {
+  setTerrain(terrain: Terrain): void; // asienta árboles, casa, bandera y postes sobre el terreno
+}
+
+export function createScenery(scene: THREE.Scene): Scenery {
   const rand = mulberry32(20261015);
   const between = (min: number, max: number): number => min + rand() * (max - min);
 
@@ -30,10 +37,16 @@ export function createScenery(scene: THREE.Scene): void {
   addOuterGround(scene);
   addMountains(scene, rand, between);
   addClouds(scene, rand, between);
-  addTrees(scene, rand, between);
-  addClubhouse(scene);
-  addFlagPole(scene, 105, -85);
-  addYardageMarkers(scene);
+  const settlers = [
+    addTrees(scene, rand, between),
+    addClubhouse(scene),
+    addFlagPole(scene, 105, -85),
+    addYardageMarkers(scene),
+  ];
+
+  const setTerrain = (terrain: Terrain): void => settlers.forEach((settle) => settle(terrain));
+  setTerrain(FLAT_TERRAIN);
+  return { setTerrain };
 }
 
 // Cielo con degradado: más claro en el horizonte, más azul arriba.
@@ -58,14 +71,15 @@ function addSky(scene: THREE.Scene): void {
   scene.add(sky);
 }
 
-// Suelo enorme y más bajo que las franjas: ya no hay vacío más allá de su borde.
+// Suelo enorme y más bajo que el terreno (cuyo punto más bajo es -4 m): ya no hay vacío
+// más allá de su borde.
 function addOuterGround(scene: THREE.Scene): void {
   const ground = new THREE.Mesh(
     new THREE.PlaneGeometry(20000, 20000),
     new THREE.MeshLambertMaterial({ color: 0x2b6e2b }),
   );
   ground.rotation.x = -Math.PI / 2;
-  ground.position.y = -3;
+  ground.position.y = -6;
   scene.add(ground);
 }
 
@@ -119,7 +133,11 @@ function addClouds(scene: THREE.Scene, rand: () => number, between: (a: number, 
 }
 
 // Árboles instanciados: dos hileras a cada lado del campo y bosque disperso alrededor.
-function addTrees(scene: THREE.Scene, rand: () => number, between: (a: number, b: number) => number): void {
+function addTrees(
+  scene: THREE.Scene,
+  rand: () => number,
+  between: (a: number, b: number) => number,
+): (terrain: Terrain) => void {
   const spots: Array<{ x: number; z: number; scale: number }> = [];
 
   for (const side of [-1, 1]) {
@@ -151,32 +169,44 @@ function addTrees(scene: THREE.Scene, rand: () => number, between: (a: number, b
     spots.length,
   );
 
-  const matrix = new THREE.Matrix4();
   const greens = [0x1f5a2a, 0x276b30, 0x2f7a35, 0x1b4d28];
-  spots.forEach((spot, i) => {
-    const s = spot.scale;
-    matrix.compose(
-      new THREE.Vector3(spot.x, 1.1 * s, spot.z),
-      new THREE.Quaternion(),
-      new THREE.Vector3(s, s, s),
-    );
-    trunk.setMatrixAt(i, matrix);
-    matrix.compose(
-      new THREE.Vector3(spot.x, (2.2 + 3.75) * s, spot.z),
-      new THREE.Quaternion(),
-      new THREE.Vector3(s, s, s),
-    );
-    foliage.setMatrixAt(i, matrix);
-    foliage.setColorAt(i, new THREE.Color(greens[Math.floor(rand() * greens.length)]));
-  });
+  spots.forEach((_, i) => foliage.setColorAt(i, new THREE.Color(greens[Math.floor(rand() * greens.length)])));
+  trunk.castShadow = true;
+  foliage.castShadow = true;
   scene.add(trunk, foliage);
+
+  // La base del tronco queda en heightAt(x, z).
+  const matrix = new THREE.Matrix4();
+  return (terrain) => {
+    spots.forEach((spot, i) => {
+      const s = spot.scale;
+      const base = terrain.heightAt(spot.x, spot.z);
+      matrix.compose(
+        new THREE.Vector3(spot.x, base + 1.1 * s, spot.z),
+        new THREE.Quaternion(),
+        new THREE.Vector3(s, s, s),
+      );
+      trunk.setMatrixAt(i, matrix);
+      matrix.compose(
+        new THREE.Vector3(spot.x, base + (2.2 + 3.75) * s, spot.z),
+        new THREE.Quaternion(),
+        new THREE.Vector3(s, s, s),
+      );
+      foliage.setMatrixAt(i, matrix);
+    });
+    trunk.instanceMatrix.needsUpdate = true;
+    foliage.instanceMatrix.needsUpdate = true;
+    trunk.computeBoundingSphere();
+    foliage.computeBoundingSphere();
+  };
 }
 
 // Casa club: punto de referencia grande y reconocible, a la izquierda y adelante.
-function addClubhouse(scene: THREE.Scene): void {
+// Los muros se prolongan 1 m bajo su base para que en una ladera no quede un hueco.
+function addClubhouse(scene: THREE.Scene): (terrain: Terrain) => void {
   const house = new THREE.Group();
-  const walls = new THREE.Mesh(new THREE.BoxGeometry(26, 8, 14), new THREE.MeshLambertMaterial({ color: 0xe8dcc0 }));
-  walls.position.y = 4;
+  const walls = new THREE.Mesh(new THREE.BoxGeometry(26, 9, 14), new THREE.MeshLambertMaterial({ color: 0xe8dcc0 }));
+  walls.position.y = 3.5;
   const roof = new THREE.Mesh(
     new THREE.ConeGeometry(19, 6, 4),
     new THREE.MeshLambertMaterial({ color: 0xb23a2e, flatShading: true }),
@@ -187,34 +217,42 @@ function addClubhouse(scene: THREE.Scene): void {
   const door = new THREE.Mesh(new THREE.BoxGeometry(3, 5, 0.3), new THREE.MeshLambertMaterial({ color: 0x4a3322 }));
   door.position.set(0, 2.5, 7.1);
   house.add(walls, roof, door);
-  house.position.set(-150, 0, -40);
   house.rotation.y = Math.PI / 3;
   scene.add(house);
+  return (terrain) => house.position.set(-150, terrain.heightAt(-150, -40), -40);
 }
 
-function addFlagPole(scene: THREE.Scene, x: number, z: number): void {
+function addFlagPole(scene: THREE.Scene, x: number, z: number): (terrain: Terrain) => void {
+  const group = new THREE.Group();
   const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 9, 6), new THREE.MeshLambertMaterial({ color: 0xffffff }));
-  pole.position.set(x, 4.5, z);
+  pole.position.y = 4.5;
   const flag = new THREE.Mesh(
     new THREE.PlaneGeometry(2.2, 1.4),
     new THREE.MeshBasicMaterial({ color: 0xd32f2f, side: THREE.DoubleSide }),
   );
-  flag.position.set(x + 1.1, 8.2, z);
-  scene.add(pole, flag);
+  flag.position.set(1.1, 8.2, 0);
+  group.add(pole, flag);
+  scene.add(group);
+  return (terrain) => group.position.set(x, terrain.heightAt(x, z), z);
 }
 
 // Postes de distancia a los lados del campo, cada 50 m desde la salida hacia -z.
-function addYardageMarkers(scene: THREE.Scene): void {
+function addYardageMarkers(scene: THREE.Scene): (terrain: Terrain) => void {
   const colors = [0xffffff, 0xffeb3b, 0xff9800, 0xe53935, 0x8e24aa, 0x1e88e5];
+  const markers: Array<{ group: THREE.Group; x: number; z: number }> = [];
   for (const side of [-1, 1]) {
     colors.forEach((color, i) => {
       const distance = (i + 1) * 50;
+      const group = new THREE.Group();
       const post = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 2.2, 6), new THREE.MeshLambertMaterial({ color: 0xf5f5f5 }));
-      post.position.set(side * 50, 1.1, -distance);
+      post.position.y = 1.1;
       const cap = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.6, 0.15), new THREE.MeshBasicMaterial({ color }));
-      cap.position.set(side * 50, 2.5, -distance);
+      cap.position.y = 2.5;
       cap.rotation.y = side * (Math.PI / 2);
-      scene.add(post, cap);
+      group.add(post, cap);
+      scene.add(group);
+      markers.push({ group, x: side * 50, z: -distance });
     });
   }
+  return (terrain) => markers.forEach((m) => m.group.position.set(m.x, terrain.heightAt(m.x, m.z), m.z));
 }

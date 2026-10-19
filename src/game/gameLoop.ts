@@ -1,15 +1,17 @@
 import * as THREE from 'three';
 import { BALL_SPEC, CELESTIAL_BODIES, DEFAULT_BODY_ID } from '../physics/bodies';
-import { FIXED_DT, isGroundContact, stepBall, type SimConfig } from '../physics/simulation';
-import type { BallState, CelestialBody, ContactPoint, ShotInput, ShotResult, Vec3, Wind } from '../physics/types';
+import { FIXED_DT, isGroundContact, restHeight, settleOnTerrain, stepBall, type SimConfig } from '../physics/simulation';
+import type { BallState, CelestialBody, ContactPoint, ShotInput, ShotResult, Terrain, Vec3, Wind } from '../physics/types';
 import type { GameScene } from '../render/scene';
 import { surfaceTypeAt } from '../world/field';
+import { TEST_TERRAIN } from '../world/testTerrain';
 import { computeShot, forwardVector, previewTrajectory } from './shot';
 
 const MAX_FRAME_TIME = 0.1; // s, evita la espiral de la muerte tras una pausa larga
 const CAMERA_BACK = 4; // m detrás del balón cuando está quieto
 const CAMERA_BACK_MOVING = 12; // m detrás del balón durante el tiro: no se le pega tanto
-const CAMERA_HEIGHT = 1.6; // m, la cámara nunca sube
+const CAMERA_HEIGHT = 1.6; // m sobre el terreno bajo la cámara; no sube con el tiro
+const CAMERA_MIN_CLEARANCE = 0.5; // m, mínimo sobre el terreno: el suavizado nunca la hunde en una loma
 const CAMERA_LOOK_AHEAD = 20; // m hacia adelante cuando el balón está quieto
 const CAMERA_LOOK_HEIGHT = 0.6; // m, altura a la que mira con el balón quieto
 const CAMERA_LOOK_HEIGHT_FACTOR = 0.2; // fracción de la altura del balón que la cámara sigue con la vista
@@ -20,19 +22,13 @@ const CAMERA_LOOK_RATE_MOVING = 3; // 1/s
 const AIM_TURN_RATE = 45; // °/s al mantener A/D o las flechas
 const TRACE_EVERY_STEPS = 4; // una muestra de la traza cada 4 pasos (1/60 s)
 
-const origin = (): BallState => ({
-  position: { x: 0, y: BALL_SPEC.radius, z: 0 },
-  velocity: { x: 0, y: 0, z: 0 },
-  angularVelocity: { x: 0, y: 0, z: 0 },
-  phase: 'idle',
-});
-
 export interface GameLoop {
   readonly config: SimConfig; // mutable: cuerpo celeste y viento se cambian en caliente
   readonly state: BallState;
   readonly isBallMoving: boolean;
   setBody(body: CelestialBody): void;
   setWind(wind: Wind): void;
+  setTerrain(terrain: Terrain): void; // cambia el suelo y reasienta el balón sobre él
   launch(initial: BallState): void;
   shoot(power: number, accuracy: number): void; // golpe con el rumbo y el contacto actuales
   reset(): void;
@@ -48,7 +44,7 @@ export interface GameLoopOptions {
 interface ShotRecord {
   origin: Vec3;
   launchSpeed: number;
-  apexY: number;
+  apexHeight: number; // m, la mayor altura del balón sobre el terreno que tiene debajo
   elapsed: number; // s desde el golpe
   steps: number;
   landed: boolean;
@@ -61,9 +57,20 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
     body: CELESTIAL_BODIES[DEFAULT_BODY_ID],
     wind: { speed: 0, headingDeg: 0 },
     surfaceAt: surfaceTypeAt,
+    terrain: TEST_TERRAIN,
   };
+  game.setTerrain(config.terrain);
+
+  // Balón quieto en el tee, apoyado sobre el terreno.
+  const origin = (): BallState => ({
+    position: { x: 0, y: restHeight(0, 0, config), z: 0 },
+    velocity: { x: 0, y: 0, z: 0 },
+    angularVelocity: { x: 0, y: 0, z: 0 },
+    phase: 'idle',
+  });
 
   let current = origin();
+  game.ball.position.set(current.position.x, current.position.y, current.position.z);
   let previous = current;
   let accumulator = 0;
   let lastTime = performance.now();
@@ -94,6 +101,7 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
   // Vista previa del golpe: se recalcula solo cuando cambia algo que la afecta.
   // Supone un golpe perfecto (poder 100 %, precisión perfecta) con el contacto elegido.
   let previewKey = '';
+  let terrainVersion = 0; // cambia con setTerrain: la vista previa debe recalcularse
   function updateAimPreview(): void {
     if (isMoving()) {
       if (previewKey !== 'hidden') game.setAimPreview(null);
@@ -109,6 +117,7 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
       config.body.id,
       config.wind.speed,
       config.wind.headingDeg,
+      terrainVersion,
       position.x.toFixed(2),
       position.z.toFixed(2),
     ].join('|');
@@ -122,12 +131,21 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
     const f = forward();
     const moving = isMoving();
     const back = moving ? CAMERA_BACK_MOVING : CAMERA_BACK;
-    const position = new THREE.Vector3(ball.x - f.x * back, CAMERA_HEIGHT, ball.z - f.z * back);
-    // En el tiro mira hacia el balón, pero siguiendo solo parte de su altura.
-    const lookHeight = Math.min(CAMERA_LOOK_HEIGHT_MAX, CAMERA_LOOK_HEIGHT + ball.y * CAMERA_LOOK_HEIGHT_FACTOR);
+    const { terrain } = config;
+    const camX = ball.x - f.x * back;
+    const camZ = ball.z - f.z * back;
+    const position = new THREE.Vector3(camX, terrain.heightAt(camX, camZ) + CAMERA_HEIGHT, camZ);
+    // En el tiro mira hacia el balón, pero siguiendo solo parte de su altura sobre el terreno.
+    const ballGround = terrain.heightAt(ball.x, ball.z);
+    const lookHeight = Math.min(
+      CAMERA_LOOK_HEIGHT_MAX,
+      CAMERA_LOOK_HEIGHT + Math.max(0, ball.y - ballGround) * CAMERA_LOOK_HEIGHT_FACTOR,
+    );
+    const aheadX = ball.x + f.x * CAMERA_LOOK_AHEAD;
+    const aheadZ = ball.z + f.z * CAMERA_LOOK_AHEAD;
     const look = moving
-      ? new THREE.Vector3(ball.x, lookHeight, ball.z)
-      : new THREE.Vector3(ball.x + f.x * CAMERA_LOOK_AHEAD, CAMERA_LOOK_HEIGHT, ball.z + f.z * CAMERA_LOOK_AHEAD);
+      ? new THREE.Vector3(ball.x, ballGround + lookHeight, ball.z)
+      : new THREE.Vector3(aheadX, terrain.heightAt(aheadX, aheadZ) + CAMERA_LOOK_HEIGHT, aheadZ);
     return { position, look };
   }
 
@@ -144,6 +162,9 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
     const positionRate = moving ? CAMERA_FOLLOW_RATE_MOVING : CAMERA_FOLLOW_RATE;
     const lookRate = moving ? CAMERA_LOOK_RATE_MOVING : CAMERA_FOLLOW_RATE;
     game.camera.position.lerp(targets.position, 1 - Math.exp(-positionRate * frameTime));
+    // El suavizado cruza lomas con retraso: que nunca quede bajo el suelo.
+    const cam = game.camera.position;
+    cam.y = Math.max(cam.y, config.terrain.heightAt(cam.x, cam.z) + CAMERA_MIN_CLEARANCE);
     cameraLook.lerp(targets.look, 1 - Math.exp(-lookRate * frameTime));
     game.camera.lookAt(cameraLook);
   }
@@ -186,14 +207,19 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
     requestAnimationFrame(frame);
   }
 
+  // Altura del balón sobre el terreno que tiene justo debajo (0 apoyado en el suelo).
+  function heightAboveTerrain(position: Vec3): number {
+    return Math.max(0, position.y - config.terrain.heightAt(position.x, position.z) - config.ball.radius);
+  }
+
   // Acumula las medidas del tiro. Distancia, altura máxima y tiempo de vuelo se
   // cierran en el primer contacto con el suelo; la traza, cuando el balón se detiene.
   function recordStep(before: BallState, after: BallState): void {
     if (!record) return;
     record.elapsed += FIXED_DT;
     record.steps += 1;
-    if (!record.landed) record.apexY = Math.max(record.apexY, after.position.y);
-    const contact = isGroundContact(before, after);
+    if (!record.landed) record.apexHeight = Math.max(record.apexHeight, heightAboveTerrain(after.position));
+    const contact = isGroundContact(before, after, config.terrain);
     if (record.steps % TRACE_EVERY_STEPS === 0 || contact || after.phase === 'stopped') {
       record.trace.push({ ...after.position });
     }
@@ -202,7 +228,7 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
       record.landed = true;
       options.onShotLanded?.({
         distance: Math.hypot(after.position.x - record.origin.x, after.position.z - record.origin.z),
-        apexHeight: record.apexY - config.ball.radius,
+        apexHeight: record.apexHeight,
         flightTime: record.elapsed,
         launchSpeed: record.launchSpeed,
         trace: record.trace,
@@ -221,7 +247,7 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
     record = {
       origin: { ...initial.position },
       launchSpeed: Math.hypot(initial.velocity.x, initial.velocity.y, initial.velocity.z),
-      apexY: initial.position.y,
+      apexHeight: heightAboveTerrain(initial.position),
       elapsed: 0,
       steps: 0,
       landed: false,
@@ -279,6 +305,15 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
     },
     setWind(wind) {
       config.wind = wind;
+    },
+    setTerrain(terrain) {
+      config.terrain = terrain;
+      terrainVersion += 1;
+      game.setTerrain(terrain);
+      // El balón queda sobre el nuevo suelo; si ya no puede estar quieto, empieza a rodar.
+      previous = current = settleOnTerrain(current, config);
+      game.ball.position.set(current.position.x, current.position.y, current.position.z);
+      game.updateShadow(current.position);
     },
     launch,
     shoot,

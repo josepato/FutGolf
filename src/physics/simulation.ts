@@ -1,4 +1,4 @@
-import type { BallSpec, BallState, CelestialBody, SurfaceType, Vec3, Wind } from './types';
+import type { BallSpec, BallState, CelestialBody, SurfaceType, Terrain, Vec3, Wind } from './types';
 
 // Paso de simulación fijo, integrado con RK4.
 export const FIXED_DT = 1 / 240; // s
@@ -8,6 +8,7 @@ export interface SimConfig {
   body: CelestialBody;
   wind: Wind;
   surfaceAt: (position: Vec3) => SurfaceType; // superficie bajo el balón
+  terrain: Terrain;
 }
 
 // Estado que integra RK4. El spin se mantiene constante durante el vuelo.
@@ -23,6 +24,7 @@ interface Derivative {
 }
 
 const add = (a: Vec3, b: Vec3): Vec3 => ({ x: a.x + b.x, y: a.y + b.y, z: a.z + b.z });
+const sub = (a: Vec3, b: Vec3): Vec3 => ({ x: a.x - b.x, y: a.y - b.y, z: a.z - b.z });
 const scale = (a: Vec3, k: number): Vec3 => ({ x: a.x * k, y: a.y * k, z: a.z * k });
 
 const norm = (a: Vec3): number => Math.hypot(a.x, a.y, a.z);
@@ -31,6 +33,22 @@ const cross = (a: Vec3, b: Vec3): Vec3 => ({
   y: a.z * b.x - a.x * b.z,
   z: a.x * b.y - a.y * b.x,
 });
+
+const dot = (a: Vec3, b: Vec3): number => a.x * b.x + a.y * b.y + a.z * b.z;
+
+// Holgura del balón sobre el terreno: distancia con signo desde el centro hasta el plano
+// tangente (medida sobre la normal) menos el radio. Hay contacto cuando vale 0 o menos.
+function clearance(position: Vec3, config: SimConfig): number {
+  const { terrain, ball } = config;
+  const n = terrain.normalAt(position.x, position.z);
+  return (position.y - terrain.heightAt(position.x, position.z)) * n.y - ball.radius;
+}
+
+// Altura del centro del balón apoyado en el terreno en (x, z).
+export function restHeight(x: number, z: number, config: SimConfig): number {
+  const { terrain, ball } = config;
+  return terrain.heightAt(x, z) + ball.radius / terrain.normalAt(x, z).y;
+}
 
 // Velocidad del aire hacia donde sopla el viento. Rumbo 0 = hacia -z; crece en
 // sentido horario visto desde arriba, así que 90° sopla hacia +x.
@@ -119,10 +137,10 @@ export interface FlightOutcome {
 
 const MAX_FLIGHT_TIME = 600; // s, tope de seguridad
 
-// Simula el vuelo hasta el primer contacto con el suelo: el centro del balón
-// baja hasta y = radio. El instante exacto se interpola entre dos pasos.
+// Simula el vuelo hasta el primer contacto con el terreno: el centro del balón baja
+// hasta quedar a un radio de la superficie (sobre la normal). El instante exacto se
+// interpola entre dos pasos.
 export function simulateFlight(initial: BallState, config: SimConfig, dt: number = FIXED_DT): FlightOutcome {
-  const groundY = config.ball.radius;
   let state: BallState = { ...initial, phase: 'flying' };
   let time = 0;
   let apexY = state.position.y;
@@ -130,15 +148,14 @@ export function simulateFlight(initial: BallState, config: SimConfig, dt: number
 
   while (time < MAX_FLIGHT_TIME) {
     const next = stepFlight(state, config, dt);
-    const crossed = state.position.y > groundY && next.position.y <= groundY;
+    const before = clearance(state.position, config);
+    const after = clearance(next.position, config);
 
-    if (crossed) {
-      const fraction = (state.position.y - groundY) / (state.position.y - next.position.y);
-      const landingPosition: Vec3 = {
-        x: state.position.x + (next.position.x - state.position.x) * fraction,
-        y: groundY,
-        z: state.position.z + (next.position.z - state.position.z) * fraction,
-      };
+    if (before > 0 && after <= 0) {
+      const fraction = before / (before - after);
+      const x = state.position.x + (next.position.x - state.position.x) * fraction;
+      const z = state.position.z + (next.position.z - state.position.z) * fraction;
+      const landingPosition: Vec3 = { x, y: restHeight(x, z, config), z };
       trace.push(landingPosition);
       return {
         landingPosition,
@@ -165,113 +182,217 @@ export const ROLLING_THRESHOLD = 0.5; // m/s
 // Por debajo de esta velocidad horizontal el balón se considera detenido.
 export const STOP_SPEED = 0.05; // m/s
 
-// Impacto con el suelo (plano y = 0, centro del balón en y = radio, vy < 0).
-// La componente normal se multiplica por −restitución. La tangencial recibe un
-// impulso de fricción de Coulomb (limitado por μ·J_normal) que también cambia
-// el spin. Si queda poca velocidad normal pasa a rodar con el spin acoplado.
-export function applyBounce(state: BallState, surface: SurfaceType, ball: BallSpec): BallState {
+const UP: Vec3 = { x: 0, y: 1, z: 0 };
+
+// Impacto con el suelo de normal `normal` (unitaria, hacia arriba; ŷ por defecto), con el
+// centro del balón a un radio de la superficie y v·n < 0. La componente normal se
+// multiplica por −restitución. La tangencial recibe un impulso de fricción de Coulomb
+// (limitado por μ·J_normal) que también cambia el spin. Si queda poca velocidad normal
+// pasa a rodar con el spin acoplado.
+export function applyBounce(
+  state: BallState,
+  surface: SurfaceType,
+  ball: BallSpec,
+  normal: Vec3 = UP,
+): BallState {
   const { radius, momentOfInertiaFactor: f } = ball;
   const { velocity: v, angularVelocity: w } = state;
-  const normalSpeed = -v.y; // > 0 al impactar
+  const n = normal;
+  const normalSpeed = -dot(v, n); // > 0 al impactar
+  const tangential = sub(v, scale(n, dot(v, n)));
 
-  // Velocidad del punto de contacto (r_c = −r·ŷ): u = v + ω × r_c, componentes x y z.
-  const ux = v.x + w.z * radius;
-  const uz = v.z - w.x * radius;
-  const slip = Math.hypot(ux, uz);
+  // Velocidad del punto de contacto (r_c = −r·n): u = v + ω × r_c; solo cuenta su parte tangencial.
+  const u = sub(v, scale(cross(w, n), radius));
+  const slipVelocity = sub(u, scale(n, dot(u, n)));
+  const slip = norm(slipVelocity);
 
-  let dvx = 0;
-  let dvz = 0;
+  let impulse: Vec3 = { x: 0, y: 0, z: 0 }; // por unidad de masa
   if (slip > 0) {
     const maxImpulse = surface.slidingFriction * (1 + surface.restitution) * normalSpeed; // μ·J_n / m
     const stickImpulse = slip / (1 + 1 / f); // el que anula el deslizamiento
-    const impulse = Math.min(maxImpulse, stickImpulse);
-    dvx = (-ux / slip) * impulse;
-    dvz = (-uz / slip) * impulse;
+    impulse = scale(slipVelocity, -Math.min(maxImpulse, stickImpulse) / slip);
   }
 
-  const velocity: Vec3 = { x: v.x + dvx, y: surface.restitution * normalSpeed, z: v.z + dvz };
-  // Δω = (r_c × J) / I con I = f·m·r²  →  (−Δvz, 0, Δvx) / (f·r)
-  const angularVelocity: Vec3 = { x: w.x - dvz / (f * radius), y: w.y, z: w.z + dvx / (f * radius) };
+  const bouncedNormalSpeed = surface.restitution * normalSpeed;
+  // Δω = (r_c × J) / I con I = f·m·r²  →  −(n × J) / (f·r)
+  const angularVelocity = sub(w, scale(cross(n, impulse), 1 / (f * radius)));
 
-  if (velocity.y < ROLLING_THRESHOLD) {
+  if (bouncedNormalSpeed < ROLLING_THRESHOLD) {
+    const alongSurface = add(tangential, impulse);
     return {
-      position: { x: state.position.x, y: radius, z: state.position.z },
-      velocity: { x: velocity.x, y: 0, z: velocity.z },
-      angularVelocity: coupleSpinToRolling(angularVelocity, velocity, radius),
+      position: state.position,
+      velocity: alongSurface,
+      angularVelocity: coupleSpinToRolling(angularVelocity, alongSurface, radius, n),
       phase: 'rolling',
     };
   }
-  return { position: state.position, velocity, angularVelocity, phase: 'flying' };
+  return {
+    position: state.position,
+    velocity: add(add(tangential, impulse), scale(n, bouncedNormalSpeed)),
+    angularVelocity,
+    phase: 'flying',
+  };
 }
 
-// Rodar sin deslizar: u = 0  →  ω.z = −vx/r, ω.x = vz/r. El spin vertical se conserva.
-function coupleSpinToRolling(w: Vec3, v: Vec3, radius: number): Vec3 {
-  return { x: v.z / radius, y: w.y, z: -v.x / radius };
+// Rodar sin deslizar sobre una superficie de normal n: u = 0  →  ω_t = (n × v) / r. El
+// spin sobre la normal (ω·n) se conserva.
+function coupleSpinToRolling(w: Vec3, v: Vec3, radius: number, n: Vec3): Vec3 {
+  return add(scale(cross(n, v), 1 / radius), scale(n, dot(w, n)));
 }
 
+// Si al rodar la velocidad apunta hacia afuera de la nueva superficie más que esto
+// (por ejemplo al pasar una cima en arista), el balón despega.
+export const TAKEOFF_THRESHOLD = 0.3; // m/s
+
+// Un paso de rodadura sobre el terreno. Aceleración tangencial: gravedad tangencial
+// g_t / (1 + f) (rueda sin deslizar) menos la resistencia de rodadura μr·g·cosθ opuesta
+// a la velocidad. El balón solo se detiene si la pendiente no vence a la resistencia
+// (tan θ ≤ μr·(1 + f)), así que en una cuesta fuerte arranca solo desde el reposo.
 function stepRolling(state: BallState, config: SimConfig, dt: number): BallState {
-  const { ball, body } = config;
+  const { ball, body, terrain } = config;
+  const n = terrain.normalAt(state.position.x, state.position.z);
   const surface = config.surfaceAt(state.position);
-  const decel = surface.rollingResistance * body.gravity;
-  const speed = Math.hypot(state.velocity.x, state.velocity.z);
-  const newSpeed = speed - decel * dt;
+  const resistance = surface.rollingResistance * body.gravity * n.y; // m/s², módulo
+  const g = body.gravity;
+  const slopeAccel = scale(
+    { x: g * n.y * n.x, y: g * n.y * n.y - g, z: g * n.y * n.z },
+    1 / (1 + ball.momentOfInertiaFactor),
+  );
+  const slopeStrength = norm(slopeAccel);
+  const holds = slopeStrength <= resistance; // la pendiente no vence a la resistencia
 
-  if (newSpeed < STOP_SPEED) {
+  const stopped: BallState = {
+    position: state.position,
+    velocity: { x: 0, y: 0, z: 0 },
+    angularVelocity: { x: 0, y: 0, z: 0 },
+    phase: 'stopped',
+  };
+
+  const tangential = sub(state.velocity, scale(n, dot(state.velocity, n)));
+  const speed = norm(tangential);
+  let velocity: Vec3;
+  if (speed > 1e-9) {
+    velocity = add(tangential, scale(sub(slopeAccel, scale(tangential, resistance / speed)), dt));
+    if (dot(velocity, tangential) <= 0) {
+      // Se pararía dentro de este paso: o se queda quieto o la cuesta lo devuelve.
+      if (holds) return stopped;
+      velocity = scale(slopeAccel, (1 - resistance / slopeStrength) * dt);
+    }
+  } else {
+    if (holds) return stopped;
+    velocity = scale(slopeAccel, (1 - resistance / slopeStrength) * dt);
+  }
+  if (holds && norm(velocity) < STOP_SPEED) return stopped;
+
+  // Desplazamiento con la velocidad media (exacto con aceleración constante).
+  const displacement = scale(add(tangential, velocity), dt / 2);
+  const moved = add(state.position, displacement);
+  const newNormal = terrain.normalAt(moved.x, moved.z);
+
+  // El spin sobre la normal decae con la misma fricción: α = μr·g·cosθ / r.
+  const wn = dot(state.angularVelocity, n);
+  const wnDecay = (resistance / ball.radius) * dt;
+  const newWn = Math.abs(wn) <= wnDecay ? 0 : wn - Math.sign(wn) * wnDecay;
+
+  if (dot(velocity, newNormal) > TAKEOFF_THRESHOLD) {
     return {
-      position: state.position,
-      velocity: { x: 0, y: 0, z: 0 },
-      angularVelocity: { x: 0, y: 0, z: 0 },
-      phase: 'stopped',
+      position: moved,
+      velocity,
+      angularVelocity: coupleSpinToRolling(scale(n, newWn), velocity, ball.radius, n),
+      phase: 'flying',
     };
   }
 
-  const dirX = state.velocity.x / speed;
-  const dirZ = state.velocity.z / speed;
-  const travelled = speed * dt - 0.5 * decel * dt * dt;
-  const velocity: Vec3 = { x: dirX * newSpeed, y: 0, z: dirZ * newSpeed };
-  // El spin vertical decae con la misma fricción: α = μr·g / r.
-  const wy = state.angularVelocity.y;
-  const wyDecay = (decel / ball.radius) * dt;
-  const newWy = Math.abs(wy) <= wyDecay ? 0 : wy - Math.sign(wy) * wyDecay;
-
+  // Sigue pegado al terreno: la velocidad se gira al nuevo plano tangente conservando su módulo.
+  const onPlane = sub(velocity, scale(newNormal, dot(velocity, newNormal)));
+  const planeSpeed = norm(onPlane);
+  const rolled = planeSpeed > 0 ? scale(onPlane, norm(velocity) / planeSpeed) : onPlane;
   return {
-    position: { x: state.position.x + dirX * travelled, y: ball.radius, z: state.position.z + dirZ * travelled },
-    velocity,
-    angularVelocity: coupleSpinToRolling({ x: 0, y: newWy, z: 0 }, velocity, ball.radius),
+    position: { x: moved.x, y: restHeight(moved.x, moved.z, config), z: moved.z },
+    velocity: rolled,
+    angularVelocity: coupleSpinToRolling(scale(newNormal, newWn), rolled, ball.radius, newNormal),
     phase: 'rolling',
   };
 }
 
 function stepFlying(state: BallState, config: SimConfig, dt: number): BallState {
-  const groundY = config.ball.radius;
   const next = stepFlight(state, config, dt);
-  if (next.position.y > groundY || next.velocity.y >= 0) return { ...next, phase: 'flying' };
+  const nextNormal = config.terrain.normalAt(next.position.x, next.position.z);
+  const after = clearance(next.position, config);
+  if (after > 0 || dot(next.velocity, nextNormal) >= 0) return { ...next, phase: 'flying' };
 
-  // Contacto con el suelo dentro de este paso: se interpola el instante.
-  const drop = state.position.y - next.position.y;
-  const fraction = drop > 0 ? Math.min(1, Math.max(0, (state.position.y - groundY) / drop)) : 1;
+  // Contacto con el terreno dentro de este paso: se interpola el instante.
+  const before = clearance(state.position, config);
+  const gap = before - after;
+  const fraction = gap > 0 ? Math.min(1, Math.max(0, before / gap)) : 1;
+  const x = state.position.x + (next.position.x - state.position.x) * fraction;
+  const z = state.position.z + (next.position.z - state.position.z) * fraction;
   const contact: BallState = {
-    position: {
-      x: state.position.x + (next.position.x - state.position.x) * fraction,
-      y: groundY,
-      z: state.position.z + (next.position.z - state.position.z) * fraction,
-    },
+    position: { x, y: restHeight(x, z, config), z },
     velocity: next.velocity,
     angularVelocity: next.angularVelocity,
     phase: 'flying',
   };
-  const bounced = applyBounce(contact, config.surfaceAt(contact.position), config.ball);
+  const normal = config.terrain.normalAt(x, z);
+  if (dot(contact.velocity, normal) >= 0) return { ...next, phase: 'flying' }; // ya se aleja de la superficie
+  const bounced = applyBounce(contact, config.surfaceAt(contact.position), config.ball, normal);
 
-  // El resto del paso se avanza con la velocidad posterior al rebote.
+  // El resto del paso se avanza con la velocidad posterior al rebote, sin bajar del terreno.
   const remaining = (1 - fraction) * dt;
+  const nx = bounced.position.x + bounced.velocity.x * remaining;
+  const nz = bounced.position.z + bounced.velocity.z * remaining;
   return {
     ...bounced,
     position: {
-      x: bounced.position.x + bounced.velocity.x * remaining,
-      y: Math.max(groundY, bounced.position.y + bounced.velocity.y * remaining),
-      z: bounced.position.z + bounced.velocity.z * remaining,
+      x: nx,
+      y: Math.max(restHeight(nx, nz, config), bounced.position.y + bounced.velocity.y * remaining),
+      z: nz,
     },
   };
+}
+
+// ¿La pendiente en `position` es menor que el ángulo de reposo de su superficie? Es la
+// condición de reposo del balón: g·sinθ/(1+f) ≤ μr·g·cosθ  (tan θ ≤ μr·(1+f)).
+export function holdsOnSlope(position: Vec3, config: SimConfig): boolean {
+  const n = config.terrain.normalAt(position.x, position.z);
+  const surface = config.surfaceAt(position);
+  return Math.hypot(n.x, n.z) / (1 + config.ball.momentOfInertiaFactor) <= surface.rollingResistance * n.y;
+}
+
+// Reasienta el balón tras cambiar el terreno bajo sus pies. Un balón quieto queda sobre la
+// nueva superficie y, si la pendiente vence a la resistencia, empieza a rodar desde el
+// reposo; uno que rueda gira su velocidad al nuevo plano; uno en el aire solo se sube si
+// quedó bajo el suelo.
+export function settleOnTerrain(state: BallState, config: SimConfig): BallState {
+  const { x, z } = state.position;
+  const rest = restHeight(x, z, config);
+  const n = config.terrain.normalAt(x, z);
+
+  switch (state.phase) {
+    case 'flying':
+      return state.position.y >= rest ? state : { ...state, position: { x, y: rest, z } };
+    case 'rolling': {
+      const onPlane = sub(state.velocity, scale(n, dot(state.velocity, n)));
+      const planeSpeed = norm(onPlane);
+      const velocity = planeSpeed > 0 ? scale(onPlane, norm(state.velocity) / planeSpeed) : onPlane;
+      return {
+        ...state,
+        position: { x, y: rest, z },
+        velocity,
+        angularVelocity: coupleSpinToRolling(state.angularVelocity, velocity, config.ball.radius, n),
+      };
+    }
+    default: {
+      const position = { x, y: rest, z };
+      const quiet: BallState = {
+        position,
+        velocity: { x: 0, y: 0, z: 0 },
+        angularVelocity: { x: 0, y: 0, z: 0 },
+        phase: state.phase,
+      };
+      return holdsOnSlope(position, config) ? quiet : { ...quiet, phase: 'rolling' };
+    }
+  }
 }
 
 // Un paso de simulación completo, según la fase del balón.
@@ -287,12 +408,14 @@ export function stepBall(state: BallState, config: SimConfig, dt: number = FIXED
 }
 
 // ¿Hubo un contacto con el suelo entre dos pasos consecutivos del vuelo?
-// (un rebote que sube de nuevo, o el paso directo a rodar)
-export function isGroundContact(before: BallState, after: BallState): boolean {
-  return (
-    before.phase === 'flying' &&
-    (after.phase === 'rolling' || (before.velocity.y < 0 && after.velocity.y > 0))
-  );
+// (un rebote que sale por la normal, o el paso directo a rodar). Se mide la velocidad
+// sobre la normal del terreno, no sobre y: en una pendiente un rebote puede seguir
+// bajando en y y aun así estar alejándose de la superficie.
+export function isGroundContact(before: BallState, after: BallState, terrain: Terrain): boolean {
+  if (before.phase !== 'flying') return false;
+  if (after.phase === 'rolling') return true;
+  const n = terrain.normalAt(after.position.x, after.position.z);
+  return dot(before.velocity, n) < 0 && dot(after.velocity, n) > 0;
 }
 
 export interface RunOutcome {
@@ -311,7 +434,7 @@ export function simulateUntilStopped(initial: BallState, config: SimConfig, dt: 
 
   while (state.phase !== 'stopped' && time < MAX_FLIGHT_TIME) {
     const next = stepBall(state, config, dt);
-    if (isGroundContact(state, next)) bounces += 1;
+    if (isGroundContact(state, next, config.terrain)) bounces += 1;
     state = next;
     time += dt;
     trace.push(state.position);
