@@ -1,11 +1,20 @@
 import * as THREE from 'three';
 import { BALL_SPEC } from '../physics/bodies';
-import type { SurfaceId, Vec3 } from '../physics/types';
-import { FIELD_EXTENSION, FIELD_HALF_WIDTH, SURFACE_BANDS } from '../world/field';
+import type { SurfaceId, Terrain, TerrainBounds, Vec3 } from '../physics/types';
+import { FIELD_EXTENSION, FIELD_HALF_WIDTH, SURFACE_BANDS, surfaceAt } from '../world/field';
 import { createScenery, HORIZON_COLOR } from '../world/scenery';
+import { addContourLines, createReliefArrows } from './reliefAids';
+import { FLAT_TERRAIN } from '../world/terrain';
 
 const BALL_RADIUS = BALL_SPEC.radius;
-const SUN_DIRECTION = new THREE.Vector3(-40, 80, 30); // hacia el sol; también orienta la sombra
+// Hacia el sol: bajo y lateral, para que las laderas se vean claras u oscuras según su
+// orientación y las lomas proyecten sombra.
+const SUN_DIRECTION = new THREE.Vector3(-60, 45, 35);
+// Dirección con la que se proyecta la mancha de sombra del balón: más vertical que el sol
+// real para que la mancha no se aleje decenas de metros cuando el balón vuela alto.
+const BALL_SHADOW_DIRECTION = new THREE.Vector3(-40, 80, 30);
+const SHADOW_HALF_SIZE = 70; // m: la sombra proyectada cubre este radio alrededor del balón
+const SHADOW_MAP_SIZE = 4096;
 
 // Mancha suave y oscura, transparente en el borde.
 function createShadowTexture(): THREE.CanvasTexture {
@@ -29,6 +38,55 @@ const SURFACE_COLORS: Record<SurfaceId, number> = {
   sand: 0xdcc88a,
 };
 
+const GROUND_STEP = 2; // m entre vértices de la malla del terreno en pantalla
+// Zona que se dibuja con malla cuando el terreno no tiene límites (FLAT_TERRAIN).
+const DEFAULT_GROUND_BOUNDS: TerrainBounds = { minX: -200, maxX: 200, minZ: -360, maxZ: 120 };
+
+// Malla del terreno: un vértice cada GROUND_STEP m muestreado de `terrain`, con normales
+// suaves del propio terreno y color por superficie (según la franja de z).
+function buildTerrainGeometry(terrain: Terrain, bounds: TerrainBounds): THREE.BufferGeometry {
+  const nx = Math.floor((bounds.maxX - bounds.minX) / GROUND_STEP) + 1;
+  const nz = Math.floor((bounds.maxZ - bounds.minZ) / GROUND_STEP) + 1;
+  const positions = new Float32Array(nx * nz * 3);
+  const normals = new Float32Array(nx * nz * 3);
+  const colors = new Float32Array(nx * nz * 3);
+  const color = new THREE.Color();
+
+  for (let j = 0; j < nz; j++) {
+    const z = bounds.minZ + j * GROUND_STEP;
+    color.setHex(SURFACE_COLORS[surfaceAt(z)]);
+    for (let i = 0; i < nx; i++) {
+      const x = bounds.minX + i * GROUND_STEP;
+      const n = terrain.normalAt(x, z);
+      const k = (j * nx + i) * 3;
+      positions.set([x, terrain.heightAt(x, z), z], k);
+      normals.set([n.x, n.y, n.z], k);
+      colors.set([color.r, color.g, color.b], k);
+    }
+  }
+
+  // Dos triángulos por celda, con la cara hacia arriba.
+  const indices = new Uint32Array((nx - 1) * (nz - 1) * 6);
+  let t = 0;
+  for (let j = 0; j < nz - 1; j++) {
+    for (let i = 0; i < nx - 1; i++) {
+      const a = j * nx + i;
+      const b = (j + 1) * nx + i;
+      const c = j * nx + i + 1;
+      const d = (j + 1) * nx + i + 1;
+      indices.set([a, b, c, b, d, c], t);
+      t += 6;
+    }
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+  return geometry;
+}
+
 export interface GameScene {
   renderer: THREE.WebGLRenderer;
   scene: THREE.Scene;
@@ -36,7 +94,9 @@ export interface GameScene {
   ball: THREE.Mesh;
   setAimPreview(points: Vec3[] | null): void; // línea del inicio de la trayectoria de un golpe perfecto; null la oculta
   setTrace(points: Vec3[]): void; // traza del tiro anterior
-  updateShadow(ballPosition: Vec3): void; // sombra del balón en el suelo
+  updateShadow(ballPosition: Vec3): void; // sombra del balón en el suelo; recentra sombras y flechas
+  setReliefAids(aids: { contours: boolean; arrows: boolean }): void; // curvas de nivel y flechas de caída
+  setTerrain(terrain: Terrain): void; // dibuja el terreno (malla en bounds y planos planos fuera)
   render(): void;
 }
 
@@ -68,31 +128,86 @@ function createBallTexture(): THREE.CanvasTexture {
 export function createScene(canvas: HTMLCanvasElement): GameScene {
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.shadowMap.enabled = true;
 
   const scene = new THREE.Scene();
   // El cielo con degradado y el paisaje lejano los pone createScenery. La niebla
   // funde el suelo lejano con el color del horizonte.
   scene.fog = new THREE.Fog(HORIZON_COLOR, 600, 5000);
-  createScenery(scene);
+  const scenery = createScenery(scene);
+  let terrain: Terrain = FLAT_TERRAIN; // el suelo vigente; la sombra se posa sobre él
 
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x4a6b3a, 1.1));
-  const sun = new THREE.DirectionalLight(0xffffff, 1.6);
-  sun.position.copy(SUN_DIRECTION);
-  scene.add(sun);
-
-  // Una franja de suelo por cada banda de superficie.
-  SURFACE_BANDS.forEach((band, index) => {
-    // La primera y la última franja se prolongan: la física las usa fuera del campo.
-    const zStart = index === 0 ? band.zStart + FIELD_EXTENSION : band.zStart;
-    const zEnd = index === SURFACE_BANDS.length - 1 ? band.zEnd - FIELD_EXTENSION : band.zEnd;
-    const length = zStart - zEnd;
-    const geometry = new THREE.PlaneGeometry(FIELD_HALF_WIDTH * 2, length);
-    const material = new THREE.MeshLambertMaterial({ color: SURFACE_COLORS[band.surface] });
-    const strip = new THREE.Mesh(geometry, material);
-    strip.rotation.x = -Math.PI / 2;
-    strip.position.set(0, 0, (zStart + zEnd) / 2);
-    scene.add(strip);
+  // Poca luz ambiente y mucho sol rasante: el contraste entre laderas es lo que da volumen.
+  scene.add(new THREE.HemisphereLight(0xdfeeff, 0x3a5530, 0.6));
+  const sun = new THREE.DirectionalLight(0xfff4e0, 2.6);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
+  Object.assign(sun.shadow.camera, {
+    left: -SHADOW_HALF_SIZE,
+    right: SHADOW_HALF_SIZE,
+    top: SHADOW_HALF_SIZE,
+    bottom: -SHADOW_HALF_SIZE,
+    near: 1,
+    far: 500,
   });
+  sun.shadow.bias = -0.0004;
+  sun.shadow.normalBias = 0.06;
+  scene.add(sun, sun.target);
+  const sunOffset = SUN_DIRECTION.clone().normalize().multiplyScalar(250);
+  sun.position.copy(sunOffset);
+
+  const reliefArrows = createReliefArrows();
+  scene.add(reliefArrows.object);
+  let contours = { enabled: { value: 1 } };
+
+  // Suelo: malla del terreno dentro de bounds y planos planos de borde fuera, con el
+  // color de la franja de superficie que les toca. La primera y la última franja se
+  // prolongan: la física las usa fuera del campo.
+  const ground = new THREE.Group();
+  scene.add(ground);
+
+  function addFlatRect(minX: number, maxX: number, minZ: number, maxZ: number, surface: SurfaceId): void {
+    if (maxX <= minX || maxZ <= minZ) return;
+    const plane = new THREE.Mesh(
+      new THREE.PlaneGeometry(maxX - minX, maxZ - minZ),
+      new THREE.MeshLambertMaterial({ color: SURFACE_COLORS[surface] }),
+    );
+    plane.receiveShadow = true;
+    plane.rotation.x = -Math.PI / 2;
+    plane.position.set((minX + maxX) / 2, 0, (minZ + maxZ) / 2);
+    ground.add(plane);
+  }
+
+  function setTerrain(next: Terrain): void {
+    terrain = next;
+    scenery.setTerrain(next);
+    reliefArrows.setTerrain(next);
+    for (const child of [...ground.children]) {
+      const mesh = child as THREE.Mesh;
+      mesh.geometry.dispose();
+      (mesh.material as THREE.Material).dispose();
+      ground.remove(mesh);
+    }
+
+    const bounds = Number.isFinite(next.bounds.minX) ? next.bounds : DEFAULT_GROUND_BOUNDS;
+    const terrainMaterial = new THREE.MeshLambertMaterial({ vertexColors: true });
+    const previousContours = contours.enabled.value;
+    contours = addContourLines(terrainMaterial);
+    contours.enabled.value = previousContours;
+    const terrainMesh = new THREE.Mesh(buildTerrainGeometry(next, bounds), terrainMaterial);
+    terrainMesh.receiveShadow = true;
+    terrainMesh.castShadow = true;
+    ground.add(terrainMesh);
+
+    SURFACE_BANDS.forEach((band, index) => {
+      const zTop = index === 0 ? band.zStart + FIELD_EXTENSION : band.zStart;
+      const zBottom = index === SURFACE_BANDS.length - 1 ? band.zEnd - FIELD_EXTENSION : band.zEnd;
+      addFlatRect(-FIELD_HALF_WIDTH, bounds.minX, zBottom, zTop, band.surface); // a la izquierda
+      addFlatRect(bounds.maxX, FIELD_HALF_WIDTH, zBottom, zTop, band.surface); // a la derecha
+      addFlatRect(bounds.minX, bounds.maxX, Math.max(zBottom, bounds.maxZ), zTop, band.surface); // delante
+      addFlatRect(bounds.minX, bounds.maxX, zBottom, Math.min(zTop, bounds.minZ), band.surface); // detrás
+    });
+  }
 
   const ball = new THREE.Mesh(
     new THREE.SphereGeometry(BALL_RADIUS, 32, 16),
@@ -101,8 +216,9 @@ export function createScene(canvas: HTMLCanvasElement): GameScene {
   ball.position.set(0, BALL_RADIUS, 0);
   scene.add(ball);
 
-  // Sombra del balón: cae en el suelo desplazada según la dirección del sol, así la
+  // Sombra del balón: cae sobre el terreno siguiendo la dirección del sol, así la
   // distancia entre balón y sombra deja ver la altura. Más tenue y grande con la altura.
+  // Se apoya en el plano tangente del terreno en el punto donde el rayo de sol lo toca.
   const shadow = new THREE.Mesh(
     new THREE.PlaneGeometry(1, 1),
     new THREE.MeshBasicMaterial({
@@ -114,15 +230,34 @@ export function createScene(canvas: HTMLCanvasElement): GameScene {
       polygonOffsetUnits: -2,
     }),
   );
-  shadow.rotation.x = -Math.PI / 2;
-  shadow.position.y = 0.02;
+  const PLANE_NORMAL = new THREE.Vector3(0, 0, 1); // normal de un PlaneGeometry sin girar
+  const SHADOW_LIFT = 0.02; // m sobre el terreno, contra el z-fighting
   scene.add(shadow);
 
   function updateShadow(ballPosition: Vec3): void {
-    const height = Math.max(0, ballPosition.y - BALL_RADIUS);
-    const toGround = ballPosition.y / SUN_DIRECTION.y; // cuánto avanza el rayo de sol hasta el suelo
-    shadow.position.x = ballPosition.x + SUN_DIRECTION.x * -toGround;
-    shadow.position.z = ballPosition.z + SUN_DIRECTION.z * -toGround;
+    // La sombra proyectada del sol y las flechas siguen al balón (en pasos de 1 m para
+    // que el mapa de sombras no tiemble).
+    const tx = Math.round(ballPosition.x);
+    const tz = Math.round(ballPosition.z);
+    sun.target.position.set(tx, terrain.heightAt(tx, tz), tz);
+    sun.position.copy(sun.target.position).add(sunOffset);
+    reliefArrows.setCenter(ballPosition);
+
+    const height = Math.max(0, ballPosition.y - terrain.heightAt(ballPosition.x, ballPosition.z) - BALL_RADIUS);
+    // El rayo baja con la dirección opuesta al sol; el punto donde toca el terreno se
+    // busca iterando (la altura del terreno depende de dónde cae).
+    let x = ballPosition.x;
+    let z = ballPosition.z;
+    let ground = terrain.heightAt(x, z);
+    for (let i = 0; i < 6; i++) {
+      const toGround = (ballPosition.y - ground) / BALL_SHADOW_DIRECTION.y;
+      x = ballPosition.x - BALL_SHADOW_DIRECTION.x * toGround;
+      z = ballPosition.z - BALL_SHADOW_DIRECTION.z * toGround;
+      ground = terrain.heightAt(x, z);
+    }
+    const n = terrain.normalAt(x, z);
+    shadow.position.set(x + n.x * SHADOW_LIFT, ground + n.y * SHADOW_LIFT, z + n.z * SHADOW_LIFT);
+    shadow.quaternion.setFromUnitVectors(PLANE_NORMAL, new THREE.Vector3(n.x, n.y, n.z));
     const size = BALL_RADIUS * 4 * (1 + 0.1 * height); // más grande que el balón para que se lea
     shadow.scale.set(size, size, 1);
     (shadow.material as THREE.MeshBasicMaterial).opacity = 0.9 / (1 + 0.04 * height);
@@ -233,6 +368,11 @@ export function createScene(canvas: HTMLCanvasElement): GameScene {
     setAimPreview,
     setTrace,
     updateShadow,
+    setTerrain,
+    setReliefAids(aids) {
+      contours.enabled.value = aids.contours ? 1 : 0;
+      reliefArrows.setVisible(aids.arrows);
+    },
     render: () => renderer.render(scene, camera),
   };
 }

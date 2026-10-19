@@ -1,5 +1,5 @@
 // Unidades SI. Ejes de Three.js: x derecha, y arriba, z hacia la cámara.
-// El rumbo 0 apunta hacia -z. El suelo es el plano y = 0.
+// El rumbo 0 apunta hacia -z. La altura del suelo la da Terrain.heightAt (FLAT_TERRAIN: y = 0).
 
 export type Vec3 = { x: number; y: number; z: number };
 
@@ -53,6 +53,21 @@ export interface ShotInput {
   power: number; // 0..1, fijado con el 2º clic
   accuracy: number; // -1..1, fijado con el 3º clic; 0 = centro perfecto
   contact: ContactPoint;
+}
+
+export interface TerrainBounds {
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
+}
+
+// Superficie del suelo como campo de alturas y(x, z).
+export interface Terrain {
+  readonly bounds: TerrainBounds;
+  heightAt(x: number, z: number): number; // m; fuera de bounds vale 0
+  normalAt(x: number, z: number): Vec3; // unitaria, y > 0
+  slopeDegAt(x: number, z: number): number; // ángulo con la horizontal, 0..90
 }
 
 // Lo que muestra el HUD.
