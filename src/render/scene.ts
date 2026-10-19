@@ -156,7 +156,7 @@ export function createScene(canvas: HTMLCanvasElement): GameScene {
   const sunOffset = SUN_DIRECTION.clone().normalize().multiplyScalar(250);
   sun.position.copy(sunOffset);
 
-  const reliefArrows = createReliefArrows();
+  const reliefArrows = createReliefArrows((z) => SURFACE_COLORS[surfaceAt(z)]);
   scene.add(reliefArrows.object);
   let contours = { enabled: { value: 1 } };
 

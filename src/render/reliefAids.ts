@@ -76,8 +76,17 @@ function arrowGeometry(): THREE.BufferGeometry {
   return geometry;
 }
 
-const COLOR_GENTLE = new THREE.Color(0xffffff);
-const COLOR_STEEP = new THREE.Color(0xff4b2b);
+// Tono de la flecha: el color de la superficie, más claro (u oscuro si ya es muy claro,
+// como la arena) para que se lea sin gritar. Un poco más marcado cuanto más pendiente.
+const TONE_SHIFT_GENTLE = 0.1;
+const TONE_SHIFT_STEEP = 0.2;
+const hsl = { h: 0, s: 0, l: 0 };
+
+function arrowTone(surfaceColor: number, t: number, target: THREE.Color): THREE.Color {
+  target.setHex(surfaceColor).getHSL(hsl);
+  const shift = TONE_SHIFT_GENTLE + (TONE_SHIFT_STEEP - TONE_SHIFT_GENTLE) * t;
+  return target.setHSL(hsl.h, hsl.s, hsl.l > 0.6 ? hsl.l - shift : hsl.l + shift);
+}
 
 export interface ReliefArrows {
   readonly object: THREE.Object3D;
@@ -88,10 +97,10 @@ export interface ReliefArrows {
 
 // Flechas que apuntan hacia donde rodaría el balón (cuesta abajo), más largas y rojas
 // cuanto mayor la pendiente. Rejilla fija en el mundo, solo alrededor del balón.
-export function createReliefArrows(): ReliefArrows {
+export function createReliefArrows(surfaceColorAt: (z: number) => number): ReliefArrows {
   const material = new THREE.MeshBasicMaterial({
     transparent: true,
-    opacity: 0.7,
+    opacity: 0.55,
     depthWrite: false,
     side: THREE.DoubleSide,
     polygonOffset: true,
@@ -132,8 +141,8 @@ export function createReliefArrows(): ReliefArrows {
         side.crossVectors(down, normal);
 
         const t = Math.min(1, slope / ARROW_FULL_SLOPE_DEG);
-        const length = 0.9 + 1.7 * t;
-        const width = 0.6 + 0.4 * t;
+        const length = 0.7 + 1.1 * t;
+        const width = 0.5 + 0.3 * t;
         matrix.makeBasis(down.clone().multiplyScalar(length), normal, side.clone().multiplyScalar(width));
         matrix.setPosition(
           x + n.x * ARROW_LIFT,
@@ -141,7 +150,7 @@ export function createReliefArrows(): ReliefArrows {
           z + n.z * ARROW_LIFT,
         );
         mesh.setMatrixAt(count, matrix);
-        mesh.setColorAt(count, color.copy(COLOR_GENTLE).lerp(COLOR_STEEP, t));
+        mesh.setColorAt(count, arrowTone(surfaceColorAt(z), t, color));
         count += 1;
       }
     }
