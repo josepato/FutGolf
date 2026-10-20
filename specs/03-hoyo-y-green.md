@@ -1,6 +1,6 @@
 # SPEC 03 — El hoyo jugable: green, copa y conteo de golpes
 
-> **Status:** Borrador (v3: procedimiento de agua del reglamento; queda un punto abierto)
+> **Status:** Aprobado
 > **Depends on:** SPEC 01, SPEC 02
 > **Date:** 2026-10-19
 > **Objective:** Pasar del campo de prueba a un primer hoyo par 4 de ~280 m con dogleg suave, con tee, fairway, rough, bunkers, un lago, fuera de límites y un green con copa reglamentaria, donde el jugador puede terminar el hoyo embocando el balón, con conteo de golpes, penalización por fuera de límites y por agua, selector de tipo de golpe, minimapa y resultado final contra el par.
