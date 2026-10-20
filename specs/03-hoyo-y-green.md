@@ -1,6 +1,6 @@
 # SPEC 03 — El hoyo jugable: green, copa y conteo de golpes
 
-> **Status:** Borrador (v2: lago en el hoyo y elevación fijada por tipo de golpe; puntos abiertos al final)
+> **Status:** Borrador (v3: procedimiento de agua del reglamento; queda un punto abierto)
 > **Depends on:** SPEC 01, SPEC 02
 > **Date:** 2026-10-19
 > **Objective:** Pasar del campo de prueba a un primer hoyo par 4 de ~280 m con dogleg suave, con tee, fairway, rough, bunkers, un lago, fuera de límites y un green con copa reglamentaria, donde el jugador puede terminar el hoyo embocando el balón, con conteo de golpes, penalización por fuera de límites y por agua, selector de tipo de golpe, minimapa y resultado final contra el par.
@@ -23,7 +23,7 @@ El campo de prueba del SPEC 02 **se conserva** como segundo campo seleccionable 
 
 - **Hoyo 1**: par 4 de ~280 m con dogleg suave a la derecha, definido como datos (`HoleDef`). El lago es opcional por hoyo (`lakes` puede ir vacío); el Hoyo 1 sí lo lleva.
 - **Mapa de superficies en 2D** `surfaceAt(x, z)` que reemplaza las franjas por `z` en el hoyo: tee, fairway, rough, green, bunker, agua y fuera de límites (OB).
-- **Lago** con su física (el balón que cae al agua se frena casi en seco) y penalización de +1 golpe, repitiendo desde el último punto de golpeo.
+- **Lago** con su física (el balón que cae al agua se frena casi en seco) y el **procedimiento de agua del reglamento** (4-3-2): al quedar en el agua el jugador elige entre jugar como queda (sin penalización), repetir desde el último golpe, dropear en el punto de entrada o colocar el balón en la línea entre la copa y el punto de entrada; las tres últimas con +1 golpe.
 - **Caja del tee** dibujada (2 m de fondo por 3 m de ancho, reglamento 3-2-16), con el balón colocado dentro.
 - **Terreno del hoyo** (`HOLE_TERRAIN_DEF`) con relieve moderado en todo el recorrido, tee plano y green con pendientes suaves para poder leer los putts.
 - **Green**: superficie nueva `green` (rueda más rápido que el fairway), de ~14 m de radio alrededor de la copa.
@@ -41,7 +41,7 @@ El campo de prueba del SPEC 02 **se conserva** como segundo campo seleccionable 
 
 - Colisión con árboles, rocas y otros objetos (SPEC 04). Los árboles siguen siendo solo visuales.
 - Reglas especiales de bunker (SPEC 04). Aquí el bunker es solo una zona de arena con su física.
-- Opciones de penalización de agua más allá de repetir el golpe (por ejemplo, dropear en el punto de entrada): se deja para otro spec.
+- Variantes del procedimiento de agua que el texto del reglamento no deja claras (por ejemplo, colocar el balón en la línea del lado del green) y el «golpe de peligro» (sin carrera): el juego no tiene carrera, así que «jugar como queda» es un golpe normal.
 - Varios hoyos, tarjeta de 9 o 18 hoyos, selección de hoyo.
 - Guardado del mejor resultado o de cualquier dato (sigue sin haber persistencia).
 - Minimapa ampliable, rotación del minimapa y marcado de distancias.
@@ -175,19 +175,37 @@ Estado de juego (en `src/game/holeRules.ts`, puro y sin Three.js ni DOM para pro
 interface HoleState {
   strokes: number;          // golpes contados, con penalizaciones
   lastRest: Vec3;           // último punto de golpeo (donde está el balón antes de golpear)
-  status: 'playing' | 'holed';
+  status: 'playing' | 'waterRelief' | 'holed'; // waterRelief: eligiendo cómo seguir tras caer al agua
   lastEvent: 'none' | 'ob' | 'water' | 'holed';
+  waterEntry: Vec2 | null;  // último punto por donde el balón entró al lago (proyección en el suelo)
 }
 ```
 
 - Cada golpe lanzado suma 1 a `strokes`. `lastRest` se guarda justo antes de lanzar.
 - Si el balón se detiene en OB (`isOutOfBounds(x, z)` verdadero al pasar a `stopped`): `strokes += 1` y el balón vuelve a `lastRest` (reglamento 3-2-14 y 4-1-13: +1 y se repite desde el último punto).
-- Si el balón se detiene sobre `water` (`surfaceAt` devuelve `water`): `strokes += 1` y el balón vuelve a `lastRest`, igual que en OB. El agua frena al balón en menos de un metro, así que se evalúa al detenerse sin reglas aparte.
+- Si el balón se detiene **en el agua**: `status = 'waterRelief'` y el jugador elige cómo seguir (ver «Procedimiento de agua»). El agua frena al balón en menos de un metro, así que se evalúa al detenerse.
 - Si el balón queda `holed`: `status = 'holed'` y termina el hoyo. El embocado se confirma cuando el balón deja de moverse dentro de la copa.
 - El resultado se nombra por diferencia con el par: −3 albatros, −2 eagle, −1 birdie, 0 par, +1 bogey, +2 doble bogey, otra diferencia: «+N».
 - Con 1 golpe, siempre «Hoyo en uno».
 
 El `lastRest` y las penalizaciones (OB y agua) se evalúan solo cuando el balón queda `stopped` (no mientras vuela o rueda), para que un balón que cruza OB y regresa por rodadura no sea penalizado. Un balón que vuela sobre el lago sin tocarlo no recibe penalización.
+
+### Procedimiento de agua (reglamento 3-2-17, 3-3-7 y 4-3-2)
+
+- **Cuándo está en el agua:** cuando **toda su proyección vertical** (un círculo del radio del balón) queda dentro del lago. Si toca la línea del borde, está fuera (3-3-7). Un balón detenido con el centro en `water` pero tocando el borde se juega como cualquiera; la física de `water` solo lo frena.
+- **Punto de entrada:** el último punto por donde la proyección del balón cruzó el borde del lago de afuera hacia adentro. Se registra durante el vuelo y la rodadura (el punto de entrada «se extiende hacia arriba y hacia abajo», así que vale aunque el balón entre volando). Si el balón entra y sale y vuelve a entrar, vale el último cruce.
+- **Opciones** (menú con las teclas 1 a 4 cuando el balón queda en el agua):
+
+| # | Opción | Penalización | Colocación del balón |
+| --- | --- | --- | --- |
+| 1 | Jugar como queda («golpe de peligro») | 0 | no se mueve; sin carrera, lo que en este juego es un golpe normal |
+| 2 | Repetir desde el último golpe | +1 | en `lastRest` |
+| 3 | Dropear en el punto de entrada | +1 | en el punto de entrada o hasta 2 m a los lados (←/→), sin acercarse a la copa |
+| 4 | Línea entre la copa y el punto de entrada | +1 | sobre la recta copa–punto de entrada, detrás del lago (lado opuesto a la copa), a cualquier distancia (↑/↓); Enter confirma |
+
+- Las posiciones de las opciones 3 y 4 deben quedar **fuera del agua y dentro de límites**; si no, el menú no las deja confirmar. La opción 3 requiere además que la distancia a la copa no sea menor que la del punto de entrada.
+- Las penalizaciones se suman a `strokes` al confirmar la opción. Mientras `status` es `waterRelief` no se puede golpear.
+- El texto del reglamento consultado no deja claro el caso de dropear «en el lado del green» de la línea; aquí no se incluye (ver «Fuera de alcance»). Antes de aprobar conviene confirmar los textos 3-2-17 y 4-3-2 en el PDF oficial de la FIFG.
 
 ### Minimapa
 
@@ -208,7 +226,8 @@ src/world/hole1.ts          // nuevo: HOLE_1 y HOLE_1_TERRAIN_DEF
 src/world/field.ts          // las franjas pasan a ser el mapa del campo de prueba
 src/world/scenery.ts        // corredor de juego y bandera siguen el hoyo activo
 src/render/scene.ts         // color por surfaceAt(x, z); copa y bandera; bunkers, lago y OB; caja del tee
-src/game/holeRules.ts       // nuevo: HoleState, golpes, OB y agua, resultado
+src/game/holeRules.ts       // nuevo: HoleState, golpes, OB, alivio de agua, resultado
+src/ui/reliefMenu.ts        // nuevo: menú de opciones al quedar en el agua
 src/game/shot.ts            // tipos de golpe (velocidad máxima y elevación fijas por tipo)
 src/game/gameLoop.ts        // reglas de hoyo, selector de golpe, reinicio, cambio de campo
 src/ui/hud.ts               // golpes, par, tipo de golpe
@@ -220,6 +239,7 @@ tests/hole.test.ts          // nuevo: mapa de superficies, OB, terreno del hoyo
 tests/cup.test.ts           // nuevo: contacto y embocado
 tests/holeRules.test.ts     // nuevo: golpes, penalización, resultado
 tests/shotTypes.test.ts     // nuevo
+tests/waterRelief.test.ts   // nuevo: punto de entrada, opciones de agua y sus posiciones
 ```
 
 ---
@@ -230,10 +250,10 @@ tests/shotTypes.test.ts     // nuevo
 2. **`HoleDef`, `buildHole` y el mapa de superficies.** Crear `src/world/hole.ts` con prioridades green > agua > bunker > fairway > rough, distancia a la polilínea y `isOutOfBounds`. Pruebas en `tests/hole.test.ts` (puntos conocidos del Hoyo 1 en cada zona, OB, agua, simetría respecto a la línea de juego). Verificación: `npm test` pasa.
 3. **Terreno del Hoyo 1.** Crear `src/world/hole1.ts` con `HOLE_1` y `HOLE_1_TERRAIN_DEF` y pruebas de sus límites (desnivel, pendientes por zona, tee plano, plano en 3 m alrededor de la copa, pendiente máxima del green, depresión bajo el lago, tiempo de construcción). Todavía no se usa en el juego. Verificación: `npm test` pasa.
 4. **Copa en la simulación.** Contacto con el aro, caída al hueco y estado `holed` en `simulation.ts` (con `SimConfig.cup` opcional). Pruebas en `tests/cup.test.ts`: un putt lento centrado emboca, uno rápido salta la copa, uno que roza el aro sale, un balón por el borde cae o gira según el caso, y con `cup` ausente no cambia nada. Verificación: `npm test` pasa y con `cup` ausente los resultados son idénticos a los del SPEC 02.
-5. **Reglas de golpes.** Crear `src/game/holeRules.ts` con golpes, `lastRest`, penalización por OB y por agua y nombre del resultado, puro y sin DOM. Pruebas en `tests/holeRules.test.ts`. Verificación: `npm test` pasa.
+5. **Reglas de golpes.** Crear `src/game/holeRules.ts` con golpes, `lastRest`, penalización por OB, procedimiento de agua (punto de entrada y posiciones de las opciones) y nombre del resultado, puro y sin DOM. Pruebas en `tests/holeRules.test.ts` y `tests/waterRelief.test.ts`. Verificación: `npm test` pasa.
 6. **Tipos de golpe.** En `src/game/shot.ts` agregar los cuatro tipos con velocidad máxima y elevación, y que `computeShot` los use. Selector Q/E en `gameLoop.ts`. Quitar la elevación del selector de contacto y ajustar las pruebas del SPEC 01 que la usan. Pruebas en `tests/shotTypes.test.ts` (velocidad y elevación iniciales por tipo, putt sin elevación ni spin). Verificación: `npm test` pasa y con «Potente» y poder 100 % la velocidad inicial es 35 m/s.
 7. **Hoyo en pantalla.** Selector de campo en `debugPanel.ts` y `setField` en `gameLoop.ts` (terreno, mapa de superficies, copa y reglas). Color por `surfaceAt(x, z)` en la malla, copa y bandera dibujadas, bunkers, lago y OB visibles, caja del tee dibujada, corredor de juego del paisaje siguiendo la línea del hoyo, árboles fuera del corredor. El balón arranca en el tee del hoyo. Verificación: se ve el hoyo completo desde el tee, con dogleg, green, bunkers y lago, y los dos campos son seleccionables.
-8. **Juego completo.** Integrar las reglas en el bucle: contar golpes al lanzar, evaluar OB y agua al detenerse y repetir, detectar `holed` y terminar el hoyo. HUD con golpes, par y tipo de golpe. Verificación: se puede jugar un hoyo de punta a punta, incluyendo un tiro fuera de límites, uno al agua y un embocado.
+8. **Juego completo.** Integrar las reglas en el bucle: contar golpes al lanzar, evaluar OB al detenerse y repetir, mostrar el menú de agua (`src/ui/reliefMenu.ts`) con sus cuatro opciones y colocar el balón según la elegida, detectar `holed` y terminar el hoyo. HUD con golpes, par y tipo de golpe. Verificación: se puede jugar un hoyo de punta a punta, incluyendo un tiro fuera de límites, uno al agua y un embocado.
 9. **Minimapa y pantalla de resultado.** `src/ui/minimap.ts` y `src/ui/holeResult.ts`; R reinicia el hoyo. Verificación: el minimapa sigue al balón y marca la copa; al embocar aparece el resultado y R reinicia.
 10. **Afinación.** Jugar el hoyo varias veces con distintos tipos de golpe y ajustar la longitud, el ancho, el relieve del green y la velocidad del green hasta que los putts se lean y el par 4 sea alcanzable pero no trivial. Verificación: criterios de jugabilidad de abajo.
 
@@ -259,7 +279,11 @@ tests/shotTypes.test.ts     // nuevo
 - [ ] Prueba: un putt de 2 m en el green llano y recto, con la velocidad justa, emboca; con la mitad de esa velocidad no llega, y con el doble pasa de largo.
 - [ ] El lago del Hoyo 1 queda a 15 m o más de la línea de juego en su punto más cercano, a 30 m o más del centro del green y por completo dentro del rough (a menos de 45 m de la línea de juego), y no cubre el tee ni la copa.
 - [ ] Prueba: un balón que cae en el lago frena en menos de 1.5 m y queda `stopped` sobre `water`.
-- [ ] Prueba: un balón que se detiene sobre `water` suma 1 golpe de penalización y vuelve al último punto de golpeo; uno que vuela sobre el lago sin tocarlo no es penalizado.
+- [ ] Prueba: un balón cuya proyección vertical queda entera dentro del lago está en el agua; uno que toca la línea del borde no lo está.
+- [ ] Prueba: el punto de entrada es el último cruce del borde de afuera hacia adentro, también cuando el balón entra volando, y si entra, sale y vuelve a entrar vale el último cruce.
+- [ ] Prueba: las opciones de agua suman 0, +1, +1 y +1 golpes (opciones 1 a 4) y un balón que vuela sobre el lago sin tocarlo no recibe ninguna.
+- [ ] Prueba: opción 2 coloca el balón en el último punto de golpeo; opción 3 lo coloca a 2 m o menos lateralmente del punto de entrada, fuera del agua y sin acercarse a la copa; opción 4 lo coloca sobre la recta copa–punto de entrada, detrás del lago y fuera del agua.
+- [ ] Prueba: con el balón en `waterRelief` no se puede golpear hasta confirmar una opción.
 - [ ] Prueba: el conteo de golpes suma 1 por golpe lanzado.
 - [ ] Prueba: un balón que se detiene en OB suma 1 golpe de penalización y vuelve al último punto de golpeo; un balón que cruza OB rodando y regresa a la zona de juego no es penalizado.
 - [ ] Prueba: el resultado se nombra bien para −3, −2, −1, 0, +1, +2 y +4 respecto al par, y «Hoyo en uno» con 1 golpe.
@@ -292,7 +316,8 @@ tests/shotTypes.test.ts     // nuevo
 - **Sí:** OB penaliza con +1 golpe y se repite desde el último punto de golpeo (reglamento 3-2-14 y 4-1-13).
 - **Sí:** selector Q/E con cuatro tipos de golpe (Potente 35, Largo 24, Corto 14, Putt 7 m/s), decisión del SPEC 02. Cada tipo fija también su elevación; el selector de punto de contacto manda solo en el spin (y no cuenta en Putt).
 - **Sí:** el hoyo 1 lleva un lago (decisión del usuario); el lago es opcional por hoyo (`lakes` puede ir vacío). El SPEC 02 dejaba la penalización de agua al SPEC 04; pasa a este spec porque el lago ya está en el hoyo.
-- **Sí:** el agua es una superficie física muy absorbente (`water`) y la penalización se evalúa al quedar detenido, igual que OB: +1 golpe y se repite desde el último punto de golpeo. **No:** simular fluidos ni rebotes en el agua. **No:** dropear en el punto de entrada (más reglas y más interfaz; se deja para otro spec).
+- **Sí:** el agua es una superficie física muy absorbente (`water`) y se evalúa al quedar detenido, igual que OB. **No:** simular fluidos ni rebotes en el agua.
+- **Sí:** el procedimiento de agua sigue el reglamento (decisión del usuario: «como el reglamento»): cuatro opciones con su penalización (4-3-2) y el balón está en el agua solo si su proyección entera está dentro del lago (3-2-17 y 3-3-7). **No:** la versión simple de «+1 y repetir» que se propuso antes, que quitaba al jugador las opciones que da el reglamento.
 - **Sí:** la elevación la fija el tipo de golpe y el selector de contacto solo controla el spin (decisión del usuario: «cada uno escala la barra de golpe y fija su elevación»). **No:** dejar que el contacto siga cambiando la elevación: dos controles pelearían por la misma variable.
 - **Sí:** el campo de prueba del SPEC 02 se conserva con su selector. Es la herramienta de comparación y de pruebas, no se retira.
 - **Sí:** minimapa de orientación fija y tamaño fijo; sin ampliación ni rotación. **No:** hacerlo ampliable en este spec (queda como mejora).
@@ -310,6 +335,8 @@ tests/shotTypes.test.ts     // nuevo
 | Green con pendiente demasiado fuerte: los putts no se detienen | Límite de 3° y prueba de que un balón detenido en cualquier punto del green se mantiene `stopped` |
 | El OB castiga un balón que sale al rough y regresa | Evaluar OB solo al quedar `stopped`; prueba específica |
 | 280 m puede ser demasiado largo con los tipos de golpe (el máximo de Potente a 15° vuela menos de lo que parece, aun con rodadura) | Paso de afinación (10): ajustar la longitud, las elevaciones y la resistencia del fairway; el criterio de jugabilidad manda sobre los 280 m |
+| El punto de entrada se calcula mal con balones que entran volando o con rebotes en el borde | Registrar el cruce en cada paso de la simulación y quedarse con el último; pruebas de entrada volando y de entrada-salida-entrada |
+| El menú de agua se siente pesado en un juego de teclado | Teclas 1 a 4, selección con una sola pulsación y colocación inicial razonable para las opciones 3 y 4; se afina jugando |
 | El lago desbalancea el hoyo o no se puede evitar | Lago a un lado, a 15 m o más de la línea de juego, con el lado derecho del green libre |
 | Hoyo demasiado difícil o fácil | Paso de afinación jugable (10) y criterio de jugabilidad explícito; los números del hoyo no son contrato |
 | Minimapa roba atención o tapa controles | Tamaño fijo y pequeño, ubicación ajustable en la implementación |
@@ -319,21 +346,16 @@ tests/shotTypes.test.ts     // nuevo
 
 ## Puntos abiertos (a cerrar antes de aprobar)
 
-**Ya cerrados con las notas del usuario (v2):** el lago va en el hoyo 1 y es opcional por hoyo; la barra de golpe escala la velocidad máxima de cada tipo y cada tipo fija su elevación; la caja del tee del reglamento se incluye (dibujada).
+**Cerrados con las notas del usuario:** el lago va en el hoyo 1 y es opcional por hoyo; cada tipo de golpe fija su elevación y escala la barra (Potente 15°, Largo 25°, Corto 40°, Putt 0°, a afinar); la caja del tee se dibuja; el agua sigue el procedimiento del reglamento (v3); sin límite de golpes por hoyo; minimapa de tamaño y orientación fijos, abajo a la izquierda, sin ampliar; reglas de bunker al SPEC 04.
 
-1. **Penalización de agua:** propuesta +1 golpe y repetir desde el último punto (igual que OB). El reglamento oficial también admite dropear cerca del punto de entrada. ¿Basta con repetir?
-2. **Elevaciones por tipo:** propuesta Potente 15°, Largo 25°, Corto 40° y Putt 0° (se afinan jugando). ¿Tienes grados en mente?
-3. **Límite de golpes:** ¿hay un máximo por hoyo (por ejemplo 10) tras el cual se recoge el balón, o se juega sin límite? Propuesta: sin límite en este spec.
-4. **Tarjeta final y mejor resultado:** aquí solo hay un hoyo con su pantalla de resultado. Guardar el mejor resultado requiere persistencia, que hoy no existe. Propuesta: dejarlo para después.
-5. **Minimapa:** propuesta esquina inferior izquierda, 180 × 220 px y orientación fija, sin ampliar. ¿Prefieres que gire con el rumbo de golpe o que se amplíe al hacer clic?
-6. **Reglas de bunker:** propuesta tratarlas en el SPEC 04; aquí el bunker es solo arena con su física.
+1. **Mejor resultado y tarjeta final:** con un solo hoyo, la pantalla de resultado muestra golpes, par y nombre del resultado (birdie, par, etc.). Pendiente confirmar si, además, se guarda el menor número de golpes entre partidas en el navegador (`localStorage`), lo que sería la primera persistencia del proyecto. Propuesta: no guardar nada en este spec.
 
 ---
 
 ## Lo que **no** está en este spec
 
 - Colisión con árboles, rocas y demás objetos (SPEC 04).
-- Reglas especiales de bunker y otras opciones de penalización de agua (SPEC 04 o posterior).
+- Reglas especiales de bunker (SPEC 04) y variantes del procedimiento de agua que el reglamento no deja claras.
 - Varios hoyos, tarjeta de varios hoyos y selección de hoyo.
 - Guardado de resultados o de cualquier dato.
 - Minimapa ampliable o rotatorio y marcado de distancias.
