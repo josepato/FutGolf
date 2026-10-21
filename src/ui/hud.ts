@@ -1,10 +1,18 @@
 import type { ShotResult, Wind } from '../physics/types';
+import type { HoleSummary } from '../game/holeSession';
+import type { ShotType } from '../game/shot';
+
+// Estado del hoyo que muestra el HUD (null en un campo sin reglas de hoyo).
+export type HoleInfo = HoleSummary;
 
 export interface Hud {
   readonly element: HTMLElement;
   showResult(result: ShotResult): void;
   setWind(wind: Wind): void;
   setHeading(headingDeg: number): void;
+  setShotType(shotType: ShotType): void;
+  setHole(info: HoleInfo | null): void; // línea «Hoyo · Par · Golpes»
+  showMessage(text: string, durationMs?: number): void; // aviso breve en pantalla (fuera de límites, agua, embocado)
 }
 
 const PANEL_STYLE = [
@@ -44,16 +52,28 @@ export function createHud(parent: HTMLElement): Hud {
   help.style.cssText = `${PANEL_STYLE};left:50%;top:16px;transform:translateX(-50%);text-align:left;font-size:12px;max-width:480px`;
   const headingLine = document.createElement('div');
   headingLine.style.cssText = 'font-weight:600;font-size:14px;margin-bottom:2px';
+  const shotLine = document.createElement('div');
+  shotLine.style.cssText = 'font-weight:600;font-size:14px;margin-bottom:2px';
+  const holeLine = document.createElement('div');
+  holeLine.style.cssText = 'font-weight:600;font-size:14px;margin-bottom:2px;color:#ffe14d;display:none';
   help.append(
     headingLine,
+    holeLine,
+    shotLine,
     legendRow('#ffe14d', 'Línea amarilla: inicio del tiro si sale perfecto (poder y precisión 100%)'),
     legendRow('#00e5ff', 'Línea azul: trayectoria del tiro anterior'),
     textRow('A / D o ← →: girar el rumbo (con el balón quieto)'),
+    textRow('Q / E: tipo de golpe anterior / siguiente'),
     textRow('Clic o Espacio: barra de golpe (1.º inicia, 2.º poder, 3.º precisión)'),
-    textRow('R: regresar el balón al origen'),
+    textRow('R: reiniciar (el balón vuelve al tee; en el hoyo, golpes a 0)'),
   );
 
-  parent.append(results, windPanel, help);
+  // Aviso breve en el centro, bajo la leyenda: se desvanece solo.
+  const message = document.createElement('div');
+  message.style.cssText = `${PANEL_STYLE};left:50%;top:230px;transform:translateX(-50%);font-size:16px;font-weight:600;text-align:center;opacity:0;transition:opacity 0.3s`;
+  let messageTimer: ReturnType<typeof setTimeout> | undefined;
+
+  parent.append(results, windPanel, help, message);
 
   const ctx = windCanvas.getContext('2d')!;
   ctx.scale(dpr, dpr);
@@ -80,6 +100,30 @@ export function createHud(parent: HTMLElement): Hud {
     const rounded = Math.round(headingDeg);
     const side = rounded === 0 ? 'al frente' : rounded > 0 ? 'a la derecha' : 'a la izquierda';
     headingLine.textContent = `Rumbo: ${Math.abs(rounded)}° ${side}`;
+  }
+
+  function setHole(info: HoleInfo | null): void {
+    if (!info) {
+      holeLine.style.display = 'none';
+      return;
+    }
+    holeLine.style.display = '';
+    const strokes = `Golpes ${info.strokes}`;
+    const status = info.status === 'holed' ? ' · Hoyo terminado (R: jugar de nuevo)' : info.status === 'waterRelief' ? ' · En el agua' : '';
+    holeLine.textContent = `${info.name} · Par ${info.par} · ${strokes}${status}`;
+  }
+
+  function showMessage(text: string, durationMs = 3500): void {
+    message.textContent = text;
+    message.style.opacity = '1';
+    clearTimeout(messageTimer);
+    messageTimer = setTimeout(() => {
+      message.style.opacity = '0';
+    }, durationMs);
+  }
+
+  function setShotType(shotType: ShotType): void {
+    shotLine.textContent = `Golpe: ${shotType.name} · ${shotType.maxSpeed} m/s · ${shotType.elevationDeg}°`;
   }
 
   function titleOf(text: string): HTMLElement {
@@ -153,5 +197,5 @@ export function createHud(parent: HTMLElement): Hud {
   setWind({ speed: 0, headingDeg: 0 });
   setHeading(0);
 
-  return { element: results, showResult, setWind, setHeading };
+  return { element: results, showResult, setWind, setHeading, setShotType, setHole, showMessage };
 }

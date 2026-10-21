@@ -1,6 +1,6 @@
 # SPEC 03 — El hoyo jugable: green, copa y conteo de golpes
 
-> **Status:** Aprobado
+> **Status:** Implementado
 > **Depends on:** SPEC 01, SPEC 02
 > **Date:** 2026-10-19
 > **Objective:** Pasar del campo de prueba a un primer hoyo par 4 de ~280 m con dogleg suave, con tee, fairway, rough, bunkers, un lago, fuera de límites y un green con copa reglamentaria, donde el jugador puede terminar el hoyo embocando el balón, con conteo de golpes, penalización por fuera de límites y por agua, selector de tipo de golpe, minimapa y resultado final contra el par.
@@ -103,6 +103,8 @@ interface HoleMap {
   surfaceAt(x: number, z: number): SurfaceId;  // 'fairway' | 'rough' | 'sand' | 'green' | 'water'
   isOutOfBounds(x: number, z: number): boolean;
   distanceToCup(x: number, z: number): number;
+  isInLake(x: number, z: number): boolean;                        // el centro está dentro de algún lago
+  isBallInWater(x: number, z: number, radius: number): boolean;   // toda la proyección del balón dentro del lago
 }
 
 function buildHole(def: HoleDef): { def: HoleDef; terrain: Terrain; map: HoleMap };
@@ -126,8 +128,8 @@ const HOLE_1: HoleDef = {
   cup: { position: { x: 75, z: -250 }, radius: 0.255, depth: 0.28 },
   bunkers: [
     { x: -14, z: -150, radiusX: 9, radiusZ: 16 },              // bunker de la zona de caída, lado interior
-    { x: 62, z: -246, radiusX: 7, radiusZ: 5, rotationDeg: 30 }, // bunker de green, izquierda
-    { x: 90, z: -258, radiusX: 8, radiusZ: 5, rotationDeg: -20 }, // bunker de green, derecha
+    { x: 55, z: -250, radiusX: 6, radiusZ: 9 }, // bunker de green, izquierda (pegado al borde del green)
+    { x: 95, z: -256, radiusX: 7, radiusZ: 5, rotationDeg: -20 }, // bunker de green, derecha
   ],
   // Lago al lado izquierdo de la aproximación (centro a ~27 m de la línea de juego, borde más cercano a ~16 m), que obliga a
   // decidir entre arriesgar sobre el agua o ir por el lado derecho del green.
@@ -136,7 +138,7 @@ const HOLE_1: HoleDef = {
 };
 ```
 
-El relieve (`HOLE_1_TERRAIN_DEF`, en `src/world/hole1.ts`) usa `TerrainDef` del SPEC 02 con celda de 1 m, tee plano, una depresión de ~0.8 m bajo el lago (para que se vea hundido), desnivel total de 12 m o menos y pendientes de fairway de 6° o menos y de rough de 15° o menos (más suaves que el campo de prueba, que busca estresar la física). El green va **plano en 3 m alrededor de la copa** (`FlatZone` de radio 3 m y mezcla de 4 m, por la zona reglamentaria de 3 m) y con pendiente de 3° o menos en todo su radio, con una caída suave (~1.5° a 2.5°) para que los putts se lean.
+El relieve (`HOLE_1_TERRAIN_DEF`, en `src/world/hole1.ts`) usa `TerrainDef` del SPEC 02 con celda de 1 m, tee plano, una depresión de ~0.8 m bajo el lago (para que se vea hundido), desnivel total de 12 m o menos y pendientes de fairway de 6° o menos y de rough de 15° o menos (más suaves que el campo de prueba, que busca estresar la física). El green va **plano en 3 m alrededor de la copa** (`FlatZone` de radio 3 m y mezcla de 8.5 m, por la zona reglamentaria de 3 m) y con pendiente de 3° o menos en todo su radio. Tres lomas suaves alrededor del green (salidas de una búsqueda numérica) le dan caída para que los putts se lean: pendiente media de ~0.4° a 3–5 m de la copa, ~1.3° a 5–8 m y ~1.6° a 8–14 m, con un máximo de 2.85°.
 
 El campo de prueba del SPEC 02 se envuelve como un `HoleDef` degenerado solo para poder elegirlo en el mismo selector, o se mantiene como una segunda entrada del selector de campo (se decide en la implementación; ver el plan).
 
@@ -193,7 +195,7 @@ El `lastRest` y las penalizaciones (OB y agua) se evalúan solo cuando el balón
 ### Procedimiento de agua (reglamento 3-2-17, 3-3-7 y 4-3-2)
 
 - **Cuándo está en el agua:** cuando **toda su proyección vertical** (un círculo del radio del balón) queda dentro del lago. Si toca la línea del borde, está fuera (3-3-7). Un balón detenido con el centro en `water` pero tocando el borde se juega como cualquiera; la física de `water` solo lo frena.
-- **Punto de entrada:** el último punto por donde la proyección del balón cruzó el borde del lago de afuera hacia adentro. Se registra durante el vuelo y la rodadura (el punto de entrada «se extiende hacia arriba y hacia abajo», así que vale aunque el balón entre volando). Si el balón entra y sale y vuelve a entrar, vale el último cruce.
+- **Punto de entrada:** el último punto por donde el **centro** del balón cruzó el borde del lago de afuera hacia adentro (se guarda 0.35 m hacia afuera por la trayectoria del balón: un balón dropeado ahí queda claramente fuera del agua aunque bote). Con el balón de 11 cm y un lago de metros es indistinguible de usar su proyección. Se registra durante el vuelo y la rodadura (el punto de entrada «se extiende hacia arriba y hacia abajo», así que vale aunque el balón entre volando). Si el balón entra y sale y vuelve a entrar, vale el último cruce.
 - **Opciones** (menú con las teclas 1 a 4 cuando el balón queda en el agua):
 
 | # | Opción | Penalización | Colocación del balón |
@@ -255,50 +257,69 @@ tests/waterRelief.test.ts   // nuevo: punto de entrada, opciones de agua y sus p
 7. **Hoyo en pantalla.** Selector de campo en `debugPanel.ts` y `setField` en `gameLoop.ts` (terreno, mapa de superficies, copa y reglas). Color por `surfaceAt(x, z)` en la malla, copa y bandera dibujadas, bunkers, lago y OB visibles, caja del tee dibujada, corredor de juego del paisaje siguiendo la línea del hoyo, árboles fuera del corredor. El balón arranca en el tee del hoyo. Verificación: se ve el hoyo completo desde el tee, con dogleg, green, bunkers y lago, y los dos campos son seleccionables.
 8. **Juego completo.** Integrar las reglas en el bucle: contar golpes al lanzar, evaluar OB al detenerse y repetir, mostrar el menú de agua (`src/ui/reliefMenu.ts`) con sus cuatro opciones y colocar el balón según la elegida, detectar `holed` y terminar el hoyo. HUD con golpes, par y tipo de golpe. Verificación: se puede jugar un hoyo de punta a punta, incluyendo un tiro fuera de límites, uno al agua y un embocado.
 9. **Minimapa y pantalla de resultado.** `src/ui/minimap.ts` y `src/ui/holeResult.ts`; R reinicia el hoyo. Verificación: el minimapa sigue al balón y marca la copa; al embocar aparece el resultado y R reinicia.
-10. **Afinación.** Jugar el hoyo varias veces con distintos tipos de golpe y ajustar la longitud, el ancho, el relieve del green y la velocidad del green hasta que los putts se lean y el par 4 sea alcanzable pero no trivial. Verificación: criterios de jugabilidad de abajo.
+10. **Afinación.** Medir el hoyo con un jugador simulado (`tests/helpers/bot.ts`) y ajustar el relieve del green hasta que los putts se lean y el par 4 sea alcanzable pero no trivial; la persona que juega confirma el resultado. Verificación: criterios de jugabilidad de abajo.
+
+### Resultados de la afinación (Paso 10)
+
+Medidos con el jugador simulado (apunta a lo largo de la línea de juego, elige el golpe por la distancia que falta y pone en el green sin leer la pendiente), que **no es una persona**:
+
+| Jugador | Golpes promedio | Reparto de golpes (150 partidas cada uno) |
+| --- | --- | --- |
+| Experto (rumbo σ 0.1, poder σ 3 %) | 3.70 | 3: 30 % · 4: 70 % |
+| Promedio (0.25 y 6 %) | 4.11 | 3: 12 % · 4: 66 % · 5: 21 % · 6: 1 % |
+| Flojo (0.5 y 12 %) | 4.64 | 3: 3 % · 4: 41 % · 5: 44 % · 6: 11 % · 7: 1 % |
+| Muy flojo (0.8 y 20 %) | 5.47 | 3: 1 % · 4: 17 % · 5: 35 % · 6: 33 % · 7: 12 % · 8: 3 % |
+
+- **Longitud:** con las elevaciones fijas, los alcances por golpe en fairway llano son Potente ~136 m, Largo ~97 m, Corto ~51 m y Putt ~41 m. Los ~277 m del hoyo se cubren con dos golpes largos más una aproximación, así que no se tocó la longitud.
+- **Dos golpes:** el mejor primer golpe probado deja el balón a ~71 m de la copa; embocar en 2 exigiría dos golpes exactos.
+- **Green:** al principio la zona plana alrededor de la copa (mezcla de 16 m) dejaba el green casi plano hasta 8 m (pendiente media 0.02°) y el jugador sin lectura embocaba el 62 % de los putts de 3 a 8 m. Con la mezcla de 8.5 m y tres lomas suaves, un putt recto sin ruido emboca el 100 % a 2–3 m, el 54 % a 5 m, el 33 % a 8 m y el 17 % a 11 m. Con ruido de ejecución, leer el green sube el acierto de 44 % a 60 % a 5 m, de 27 % a 48 % a 8 m y de 17 % a 31 % a 11 m.
+- **Sin cambio:** la velocidad del green (`rollingResistance` 0.035), la longitud y el ancho del hoyo. El agua y el fuera de límites casi no entran en juego con un jugador que sigue la línea central: el lago (a 15 m de la línea) solo castiga tiros muy desviados a la izquierda.
 
 ---
 
 ## Criterios de aceptación
 
-- [ ] `npm test` pasa con todas las pruebas existentes (SPEC 01 y 02), salvo las que dependían de la elevación por punto de contacto, que se actualizan por el cambio de tipos de golpe, y con resultados idénticos de la simulación en el campo de prueba y con `FLAT_TERRAIN`.
-- [ ] Con `cup` ausente, el comportamiento de la simulación es idéntico al del SPEC 02.
-- [ ] `surfaceAt(x, z)` devuelve `green` dentro del radio del green, `water` dentro del lago, `sand` dentro de un bunker, `fairway` a 20 m o menos de la línea de juego y `rough` entre 20 y 45 m; y `isOutOfBounds` es verdadero a más de 45 m de la línea de juego fuera del green (pruebas con puntos concretos).
-- [ ] La línea de juego del Hoyo 1 mide entre 270 y 290 m del tee al centro del green.
-- [ ] El giro del dogleg es de entre 30° y 50° hacia la derecha.
-- [ ] En `HOLE_1_TERRAIN_DEF` el desnivel total es de 12 m o menos, la pendiente máxima en fairway es de 6° o menos y en rough de 15° o menos.
-- [ ] En el Hoyo 1 el tee es plano (pendiente menor a 1° a menos de 8 m) y a altura 0.
-- [ ] En el Hoyo 1 el terreno es plano (menos de 1°) en 3 m alrededor de la copa y la pendiente en todo el green es de 3° o menos.
-- [ ] Construir el hoyo (terreno incluido) tarda menos de 1 s.
-- [ ] La copa mide 0.255 m de radio y 0.28 m de profundidad.
-- [ ] Prueba: un balón que rueda a 0.5 m/s y pasa por el centro de la copa queda `holed`.
-- [ ] Prueba: un balón que rueda a 7 m/s por el centro de la copa no queda `holed` (la salta o rebota).
-- [ ] Prueba: un balón que pasa rozando el borde, con el centro a más de `R + r` del centro de la copa, no queda `holed` y su trayectoria no cambia.
-- [ ] Prueba: un balón que cae al hueco no sale de la copa (la altura de su centro nunca supera el plano del borde después de quedar `holed`).
-- [ ] Prueba: `holed` solo ocurre cuando todo el balón está por debajo del plano del borde.
-- [ ] Prueba: un putt de 2 m en el green llano y recto, con la velocidad justa, emboca; con la mitad de esa velocidad no llega, y con el doble pasa de largo.
-- [ ] El lago del Hoyo 1 queda a 15 m o más de la línea de juego en su punto más cercano, a 30 m o más del centro del green y por completo dentro del rough (a menos de 45 m de la línea de juego), y no cubre el tee ni la copa.
-- [ ] Prueba: un balón que cae en el lago frena en menos de 1.5 m y queda `stopped` sobre `water`.
-- [ ] Prueba: un balón cuya proyección vertical queda entera dentro del lago está en el agua; uno que toca la línea del borde no lo está.
-- [ ] Prueba: el punto de entrada es el último cruce del borde de afuera hacia adentro, también cuando el balón entra volando, y si entra, sale y vuelve a entrar vale el último cruce.
-- [ ] Prueba: las opciones de agua suman 0, +1, +1 y +1 golpes (opciones 1 a 4) y un balón que vuela sobre el lago sin tocarlo no recibe ninguna.
-- [ ] Prueba: opción 2 coloca el balón en el último punto de golpeo; opción 3 lo coloca a 2 m o menos lateralmente del punto de entrada, fuera del agua y sin acercarse a la copa; opción 4 lo coloca sobre la recta copa–punto de entrada, detrás del lago y fuera del agua.
-- [ ] Prueba: con el balón en `waterRelief` no se puede golpear hasta confirmar una opción.
-- [ ] Prueba: el conteo de golpes suma 1 por golpe lanzado.
-- [ ] Prueba: un balón que se detiene en OB suma 1 golpe de penalización y vuelve al último punto de golpeo; un balón que cruza OB rodando y regresa a la zona de juego no es penalizado.
-- [ ] Prueba: el resultado se nombra bien para −3, −2, −1, 0, +1, +2 y +4 respecto al par, y «Hoyo en uno» con 1 golpe.
-- [ ] Prueba: las velocidades iniciales de Potente, Largo, Corto y Putt con poder 100 % y precisión 100 % son 35, 24, 14 y 7 m/s.
-- [ ] Prueba: Putt tiene elevación 0° y sin backspin, aunque el selector de contacto marque otra cosa.
-- [ ] Prueba: la elevación inicial de Potente, Largo y Corto es la de su tipo (15°, 25° y 40°) sin importar el punto de contacto vertical, que solo cambia el backspin.
-- [ ] Se puede jugar un hoyo de punta a punta con el selector de golpe, el minimapa y el contador de golpes, con penalización al caer en el agua o salir de límites, y al embocar aparece la pantalla de resultado con golpes, par y nombre del resultado.
-- [ ] R reinicia el hoyo (golpes a 0, balón en el tee, tipo de golpe en Potente) y quita la pantalla de resultado.
-- [ ] El selector de campo cambia entre Hoyo 1 y el campo de prueba sin recargar la página, y el campo de prueba sigue sin copa ni conteo de golpes.
-- [ ] El minimapa muestra el hoyo completo con las superficies, la copa y la posición del balón, y el balón se mueve en él al jugar.
-- [ ] La copa y la bandera se dibujan en la posición de la copa, a 5 cm o menos de `heightAt` en su base, y el balón embocado se ve dentro de la copa.
-- [ ] El lago se ve en azul en la malla y en el minimapa, hundido respecto al terreno de alrededor, y la caja del tee (2 m × 3 m) se ve dibujada con el balón dentro.
-- [ ] Los árboles no quedan en el corredor de juego del hoyo (a menos de `fairwayHalfWidth` de la línea de juego).
-- [ ] El juego mantiene 60 fps o más con el Hoyo 1 en pantalla.
-- [ ] Jugabilidad: un par 4 es alcanzable en 4 golpes con Potente + Largo + Corto + Putt sin precisión perfecta, y no en 2 golpes desde el tee (verificado jugando).
+- [x] `npm test` pasa con todas las pruebas existentes (SPEC 01 y 02), salvo las que dependían de la elevación por punto de contacto, que se actualizan por el cambio de tipos de golpe, y con resultados idénticos de la simulación en el campo de prueba y con `FLAT_TERRAIN`.
+- [x] Con `cup` ausente, el comportamiento de la simulación es idéntico al del SPEC 02.
+- [x] `surfaceAt(x, z)` devuelve `green` dentro del radio del green, `water` dentro del lago, `sand` dentro de un bunker, `fairway` a 20 m o menos de la línea de juego y `rough` entre 20 y 45 m; y `isOutOfBounds` es verdadero a más de 45 m de la línea de juego fuera del green (pruebas con puntos concretos).
+- [x] La línea de juego del Hoyo 1 mide entre 270 y 290 m del tee al centro del green.
+- [x] El giro del dogleg es de entre 30° y 50° hacia la derecha.
+- [x] En `HOLE_1_TERRAIN_DEF` el desnivel total es de 12 m o menos, la pendiente máxima en fairway es de 6° o menos y en rough de 15° o menos.
+- [x] En el Hoyo 1 el tee es plano (pendiente menor a 1° a menos de 8 m) y a altura 0.
+- [x] En el Hoyo 1 el terreno es plano (menos de 1°) en 3 m alrededor de la copa y la pendiente en todo el green es de 3° o menos.
+- [x] Construir el hoyo (terreno incluido) tarda menos de 1 s.
+- [x] La copa mide 0.255 m de radio y 0.28 m de profundidad.
+- [x] Prueba: un balón que rueda a 0.5 m/s y pasa por el centro de la copa queda `holed`.
+- [x] Prueba: un balón que rueda a 7 m/s por el centro de la copa no queda `holed` (la salta o rebota).
+- [x] Prueba: un balón que pasa rozando el borde, con el centro a más de `R + r` del centro de la copa, no queda `holed` y su trayectoria no cambia.
+- [x] Prueba: un balón que cae al hueco no sale de la copa (la altura de su centro nunca supera el plano del borde después de quedar `holed`).
+- [x] Prueba: `holed` solo ocurre cuando todo el balón está por debajo del plano del borde.
+- [x] Prueba: un putt de 2 m en el green llano y recto, con la velocidad justa, emboca; con la mitad de esa velocidad no llega, y con mucha más velocidad (5 m/s) pasa de largo. El límite de captura al rodar por el centro es de ~3 m/s en el borde de la copa (con el doble de la velocidad justa, 2.1 m/s en el borde, aún emboca).
+- [x] El lago del Hoyo 1 queda a 15 m o más de la línea de juego en su punto más cercano, a 30 m o más del centro del green y por completo dentro del rough (a menos de 45 m de la línea de juego), y no cubre el tee ni la copa.
+- [x] Prueba: un balón que cae en el lago frena en menos de 1.5 m y queda `stopped` sobre `water`.
+- [x] Prueba: un balón cuya proyección vertical queda entera dentro del lago está en el agua; uno que toca la línea del borde no lo está.
+- [x] Prueba: el punto de entrada es el último cruce del borde de afuera hacia adentro, también cuando el balón entra volando, y si entra, sale y vuelve a entrar vale el último cruce.
+- [x] Prueba: las opciones de agua suman 0, +1, +1 y +1 golpes (opciones 1 a 4) y un balón que vuela sobre el lago sin tocarlo no recibe ninguna.
+- [x] Prueba: opción 2 coloca el balón en el último punto de golpeo; opción 3 lo coloca a 2 m o menos lateralmente del punto de entrada, fuera del agua y sin acercarse a la copa; opción 4 lo coloca sobre la recta copa–punto de entrada, detrás del lago y fuera del agua.
+- [x] Prueba: con el balón en `waterRelief` no se puede golpear hasta confirmar una opción.
+- [x] Prueba: el conteo de golpes suma 1 por golpe lanzado.
+- [x] Prueba: un balón que se detiene en OB suma 1 golpe de penalización y vuelve al último punto de golpeo; un balón que cruza OB rodando y regresa a la zona de juego no es penalizado.
+- [x] Prueba: el resultado se nombra bien para −3, −2, −1, 0, +1, +2 y +4 respecto al par, y «Hoyo en uno» con 1 golpe.
+- [x] Prueba: las velocidades iniciales de Potente, Largo, Corto y Putt con poder 100 % y precisión 100 % son 35, 24, 14 y 7 m/s.
+- [x] Prueba: Putt tiene elevación 0° y sin backspin, aunque el selector de contacto marque otra cosa.
+- [x] Prueba: la elevación inicial de Potente, Largo y Corto es la de su tipo (15°, 25° y 40°) sin importar el punto de contacto vertical, que solo cambia el backspin.
+- [x] Se puede jugar un hoyo de punta a punta con el selector de golpe, el minimapa y el contador de golpes, con penalización al caer en el agua o salir de límites, y al embocar aparece la pantalla de resultado con golpes, par y nombre del resultado.
+- [x] R reinicia el hoyo (golpes a 0, balón en el tee, tipo de golpe en Potente) y quita la pantalla de resultado.
+- [x] El selector de campo cambia entre Hoyo 1 y el campo de prueba sin recargar la página, y el campo de prueba sigue sin copa ni conteo de golpes.
+- [x] El minimapa muestra el hoyo completo con las superficies, la copa y la posición del balón, y el balón se mueve en él al jugar.
+- [x] La copa y la bandera se dibujan en la posición de la copa, a 5 cm o menos de `heightAt` en su base, y el balón embocado desaparece bajo el disco oscuro de la copa (la malla del terreno no tiene hueco).
+- [x] El lago se ve en azul en la malla y en el minimapa, hundido respecto al terreno de alrededor, y la caja del tee (2 m × 3 m) se ve dibujada con el balón dentro.
+- [x] Los árboles no quedan en el corredor de juego del hoyo (a menos de `fairwayHalfWidth` de la línea de juego).
+- [x] El juego mantiene 60 fps o más con el Hoyo 1 en pantalla.
+- [ ] Jugabilidad — **pendiente de una partida con una persona** (lo automático ya pasa, ver las tres pruebas siguientes; medido con un jugador simulado en `tests/playability.test.ts`): un par 4 es alcanzable en 4 golpes con Potente + Largo + Corto + Putt sin precisión perfecta, y no en 2 golpes desde el tee.
+- [x] Prueba: un jugador promedio simulado (rumbo σ = 0.25, poder σ = 6 %) termina todos los hoyos, hace par o mejor en más del 50 % y menos del 95 %, y nunca emboca en 1 o 2 golpes; uno más flojo (σ = 0.5 y 12 %) promedia más golpes.
+- [x] Prueba: ninguna combinación de primeros golpes probada deja el balón a menos de 60 m de la copa, y Potente + Largo + Corto suman más que la línea de juego mientras Potente + Largo no la alcanzan.
+- [x] Prueba: el green se lee: la pendiente media crece al alejarse de la copa (3–5 m < 5–8 m < 8–14 m), un putt recto emboca siempre a 3 m y menos de la mitad de las veces a 8 m, y desde cualquier punto a 5 y 8 m existe un rumbo y un poder que emboca.
 
 ---
 

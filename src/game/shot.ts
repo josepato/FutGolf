@@ -1,12 +1,36 @@
 import { FIXED_DT, stepBall, type SimConfig } from '../physics/simulation';
-import type { BallState, ShotInput, Vec3 } from '../physics/types';
+import type { BallState, ShotInput, ShotTypeId, Vec3 } from '../physics/types';
 
 // Valores iniciales de afinación; no son parte del contrato salvo donde la spec los cita.
-export const MAX_LAUNCH_SPEED = 35; // m/s con power = 1
-export const BASE_ELEVATION_DEG = 3; // elevación con el contacto al centro
-export const MAX_EXTRA_ELEVATION_DEG = 37; // se suma con el contacto en el borde inferior
 export const MAX_SPIN = 60; // rad/s en cada eje
 export const MAX_ACCURACY_DEVIATION_DEG = 8; // desvío de rumbo con accuracy = ±1
+
+// Tipos de golpe (selector Q/E). Cada uno fija la velocidad máxima (con power = 1) y la
+// elevación; el punto de contacto solo controla el spin y en Putt no cuenta (golpe rodado).
+// Las velocidades están decididas; las elevaciones son valores iniciales de afinación.
+export interface ShotType {
+  id: ShotTypeId;
+  name: string;
+  maxSpeed: number; // m/s con power = 1
+  elevationDeg: number; // sobre el horizonte
+  spin: boolean; // false: sin backspin ni efecto lateral
+}
+
+export const SHOT_TYPES: Record<ShotTypeId, ShotType> = {
+  powerful: { id: 'powerful', name: 'Potente', maxSpeed: 35, elevationDeg: 15, spin: true },
+  long: { id: 'long', name: 'Largo', maxSpeed: 24, elevationDeg: 25, spin: true },
+  short: { id: 'short', name: 'Corto', maxSpeed: 14, elevationDeg: 40, spin: true },
+  putt: { id: 'putt', name: 'Putt', maxSpeed: 7, elevationDeg: 0, spin: false },
+};
+
+// Orden del selector: Q va al anterior y E al siguiente, sin dar la vuelta (se detiene en los extremos).
+export const SHOT_TYPE_ORDER: readonly ShotTypeId[] = ['powerful', 'long', 'short', 'putt'];
+export const DEFAULT_SHOT_TYPE: ShotTypeId = 'powerful';
+
+export function nextShotType(current: ShotTypeId, step: 1 | -1): ShotTypeId {
+  const index = SHOT_TYPE_ORDER.indexOf(current) + step;
+  return SHOT_TYPE_ORDER[Math.min(SHOT_TYPE_ORDER.length - 1, Math.max(0, index))];
+}
 
 const clamp = (value: number, min: number, max: number): number => Math.min(max, Math.max(min, value));
 const toRadians = (degrees: number): number => (degrees * Math.PI) / 180;
@@ -23,14 +47,8 @@ export function rightVector(headingDeg: number): Vec3 {
   return { x: Math.cos(h), y: 0, z: Math.sin(h) };
 }
 
-// Elevación del tiro: balón golpeado bajo el centro (y < 0) = más globo;
-// sobre el centro (y > 0) = más raso, hasta 0°.
-export function elevationDeg(contactY: number): number {
-  const y = clamp(contactY, -1, 1);
-  return y <= 0 ? BASE_ELEVATION_DEG - y * MAX_EXTRA_ELEVATION_DEG : BASE_ELEVATION_DEG * (1 - y);
-}
-
-// Convierte un golpe en la velocidad y el spin iniciales del balón.
+// Convierte un golpe en la velocidad y el spin iniciales del balón. La velocidad máxima y la
+// elevación las fija el tipo de golpe.
 // Spin (en ejes del jugador): contact.y < 0 da backspin (ω a lo largo de "derecha"
 // positivo, el balón sube) y contact.y > 0 topspin. contact.x > 0 (golpe a la derecha
 // del centro) da spin vertical positivo, que curva el balón hacia la izquierda.
@@ -41,13 +59,14 @@ export function computeShot(input: ShotInput, position: Vec3): BallState {
   const contactY = clamp(input.contact.y, -1, 1);
 
   const actualHeading = input.headingDeg + accuracy * MAX_ACCURACY_DEVIATION_DEG;
-  const elevation = toRadians(elevationDeg(contactY));
-  const speed = power * MAX_LAUNCH_SPEED;
+  const shotType = SHOT_TYPES[input.shotType];
+  const elevation = toRadians(shotType.elevationDeg);
+  const speed = power * shotType.maxSpeed;
   const forward = forwardVector(actualHeading);
   const right = rightVector(actualHeading);
 
-  const backspin = -contactY * MAX_SPIN;
-  const sidespin = contactX * MAX_SPIN;
+  const backspin = shotType.spin ? -contactY * MAX_SPIN : 0;
+  const sidespin = shotType.spin ? contactX * MAX_SPIN : 0;
 
   return {
     position: { ...position },
@@ -93,7 +112,7 @@ export function previewTrajectory(
       nextMark += spacing;
     }
     state = next;
-    if (state.phase === 'stopped') break;
+    if (state.phase === 'stopped' || state.phase === 'holed') break;
   }
   return points;
 }

@@ -1,11 +1,12 @@
 import * as THREE from 'three';
 import { BALL_SPEC, CELESTIAL_BODIES, DEFAULT_BODY_ID } from '../physics/bodies';
 import { FIXED_DT, isGroundContact, restHeight, settleOnTerrain, stepBall, type SimConfig } from '../physics/simulation';
-import type { BallState, CelestialBody, ContactPoint, ShotInput, ShotResult, Terrain, Vec3, Wind } from '../physics/types';
+import type { BallState, CelestialBody, ContactPoint, ShotInput, ShotResult, ShotTypeId, Vec3, Wind } from '../physics/types';
 import type { GameScene } from '../render/scene';
-import { surfaceTypeAt } from '../world/field';
-import { TEST_TERRAIN } from '../world/testTerrain';
-import { computeShot, forwardVector, previewTrajectory } from './shot';
+import type { Field } from '../world/fields';
+import { RELIEF_PENALTY } from './holeRules';
+import { createHoleSession, type HoleEvent, type HoleSession, type HoleSummary, type ReliefView } from './holeSession';
+import { computeShot, DEFAULT_SHOT_TYPE, forwardVector, nextShotType, previewTrajectory } from './shot';
 
 const MAX_FRAME_TIME = 0.1; // s, evita la espiral de la muerte tras una pausa larga
 const CAMERA_BACK = 4; // m detrás del balón cuando está quieto
@@ -20,24 +21,38 @@ const CAMERA_FOLLOW_RATE = 4; // 1/s, suavizado exponencial con el balón quieto
 const CAMERA_FOLLOW_RATE_MOVING = 2; // 1/s, más lento en el tiro: la cámara se queda atrás
 const CAMERA_LOOK_RATE_MOVING = 3; // 1/s
 const AIM_TURN_RATE = 45; // °/s al mantener A/D o las flechas
+const RELIEF_LATERAL_RATE = 2; // m/s al mover el balón a los lados con las flechas (opción 3 del agua)
+const RELIEF_BEHIND_RATE = 10; // m/s al alejar o acercar el balón con las flechas (opción 4 del agua)
+const RELIEF_KEYS: Record<string, 1 | 2 | 3 | 4> = {
+  Digit1: 1, Digit2: 2, Digit3: 3, Digit4: 4,
+  Numpad1: 1, Numpad2: 2, Numpad3: 3, Numpad4: 4,
+};
 const TRACE_EVERY_STEPS = 4; // una muestra de la traza cada 4 pasos (1/60 s)
 
 export interface GameLoop {
   readonly config: SimConfig; // mutable: cuerpo celeste y viento se cambian en caliente
   readonly state: BallState;
   readonly isBallMoving: boolean;
+  readonly shotType: ShotTypeId; // tipo de golpe elegido (Q/E)
+  readonly canShoot: boolean; // balón quieto y sin estar eligiendo cómo seguir tras el agua ni con el hoyo terminado
   setBody(body: CelestialBody): void;
   setWind(wind: Wind): void;
-  setTerrain(terrain: Terrain): void; // cambia el suelo y reasienta el balón sobre él
+  setField(field: Field): void; // cambia de campo (terreno, superficies, copa) y deja el balón en su tee
   launch(initial: BallState): void;
   shoot(power: number, accuracy: number): void; // golpe con el rumbo y el contacto actuales
   reset(): void;
 }
 
 export interface GameLoopOptions {
+  field: Field; // campo con el que arranca
   getContact: () => ContactPoint; // punto de contacto elegido en el selector
   onShotLanded?: (result: ShotResult) => void; // al primer contacto con el suelo
   onAimChange?: (headingDeg: number) => void; // cuando el jugador gira el rumbo
+  onShotTypeChange?: (shotType: ShotTypeId) => void; // cuando el jugador cambia el tipo de golpe con Q/E
+  onHoleChange?: (summary: HoleSummary | null) => void; // golpes, par y estado; null en un campo sin reglas de hoyo
+  onHoleEvent?: (event: HoleEvent) => void; // fuera de límites, agua, opción de agua confirmada o embocado
+  onReliefChange?: (view: ReliefView | null) => void; // opción del agua en elección; null cuando no hay que elegir
+  onBallMove?: (position: Vec3) => void; // posición del balón en cada fotograma (para el minimapa)
 }
 
 // Registro de un tiro en curso, para el HUD y la traza.
@@ -56,14 +71,16 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
     ball: BALL_SPEC,
     body: CELESTIAL_BODIES[DEFAULT_BODY_ID],
     wind: { speed: 0, headingDeg: 0 },
-    surfaceAt: surfaceTypeAt,
-    terrain: TEST_TERRAIN,
+    surfaceAt: options.field.surfaceAt,
+    terrain: options.field.terrain,
+    cup: options.field.cup,
   };
-  game.setTerrain(config.terrain);
+  let field = options.field;
+  game.setField(field);
 
-  // Balón quieto en el tee, apoyado sobre el terreno.
+  // Balón quieto en el tee del campo, apoyado sobre el terreno.
   const origin = (): BallState => ({
-    position: { x: 0, y: restHeight(0, 0, config), z: 0 },
+    position: { x: field.tee.x, y: restHeight(field.tee.x, field.tee.z, config), z: field.tee.z },
     velocity: { x: 0, y: 0, z: 0 },
     angularVelocity: { x: 0, y: 0, z: 0 },
     phase: 'idle',
@@ -74,7 +91,18 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
   let previous = current;
   let accumulator = 0;
   let lastTime = performance.now();
-  let aimHeadingDeg = 0; // rumbo elegido con el teclado (0 = hacia -z)
+  // Reglas del hoyo (golpes, fuera de límites, agua); null en un campo sin reglas (el de prueba).
+  let session: HoleSession | null = null;
+  let awaitingStop = false; // hay un tiro en curso: al detenerse se evalúan las reglas del hoyo
+  const startSession = (): HoleSession | null => {
+    session =
+      field.rules && field.cup
+        ? createHoleSession({ ...field.rules, cup: field.cup, ballRadius: BALL_SPEC.radius })
+        : null;
+    return session;
+  };
+  let aimHeadingDeg = field.tee.headingDeg; // rumbo elegido con el teclado (0 = hacia -z)
+  let shotType: ShotTypeId = DEFAULT_SHOT_TYPE; // tipo de golpe elegido con Q/E
   const keys = new Set<string>();
 
   const cameraLook = new THREE.Vector3();
@@ -88,7 +116,7 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
 
   // A / ← giran el rumbo a la izquierda, D / → a la derecha. Solo con el balón quieto.
   function updateAim(frameTime: number): void {
-    if (isMoving()) return;
+    if (isMoving() || session?.relief) return; // con la elección del agua abierta, las flechas mueven el balón
     const left = keys.has('KeyA') || keys.has('ArrowLeft');
     const right = keys.has('KeyD') || keys.has('ArrowRight');
     const turn = (right ? 1 : 0) - (left ? 1 : 0);
@@ -101,9 +129,9 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
   // Vista previa del golpe: se recalcula solo cuando cambia algo que la afecta.
   // Supone un golpe perfecto (poder 100 %, precisión perfecta) con el contacto elegido.
   let previewKey = '';
-  let terrainVersion = 0; // cambia con setTerrain: la vista previa debe recalcularse
+  let terrainVersion = 0; // cambia con setField: la vista previa debe recalcularse
   function updateAimPreview(): void {
-    if (isMoving()) {
+    if (isMoving() || (session && !session.canShoot)) {
       if (previewKey !== 'hidden') game.setAimPreview(null);
       previewKey = 'hidden';
       return;
@@ -112,6 +140,7 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
     const { position } = current;
     const key = [
       aimHeadingDeg.toFixed(2),
+      shotType,
       contact.x.toFixed(3),
       contact.y.toFixed(3),
       config.body.id,
@@ -123,8 +152,94 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
     ].join('|');
     if (key === previewKey) return;
     previewKey = key;
-    const input: ShotInput = { headingDeg: aimHeadingDeg, power: 1, accuracy: 0, contact };
+    const input: ShotInput = { shotType, headingDeg: aimHeadingDeg, power: 1, accuracy: 0, contact };
     game.setAimPreview(previewTrajectory(input, position, config));
+  }
+
+  // --- Reglas del hoyo ---
+
+  const notifyHole = (): void => options.onHoleChange?.(session ? session.summary : null);
+
+  function notifyRelief(): void {
+    const view = session?.reliefView(current.position) ?? null;
+    options.onReliefChange?.(view);
+    const at = view?.placement.position;
+    game.setReliefMarker(at ? { x: at.x, y: 0, z: at.z } : null, view?.placement.valid ?? false);
+  }
+
+  // Apunta el rumbo hacia la copa desde donde está el balón.
+  function aimAtCup(): void {
+    if (!field.cup) return;
+    const dx = field.cup.position.x - current.position.x;
+    const dz = field.cup.position.z - current.position.z;
+    aimHeadingDeg = (Math.atan2(dx, -dz) * 180) / Math.PI;
+    options.onAimChange?.(aimHeadingDeg);
+  }
+
+  // Deja el balón quieto en (x, z) sobre el terreno (vuelve a rodar si la pendiente no lo sostiene).
+  function placeBall(x: number, z: number): void {
+    const still = { x: 0, y: 0, z: 0 };
+    current = previous = settleOnTerrain(
+      { position: { x, y: 0, z }, velocity: still, angularVelocity: still, phase: 'stopped' },
+      config,
+    );
+    awaitingStop = current.phase === 'rolling';
+    accumulator = 0;
+    game.ball.position.set(current.position.x, current.position.y, current.position.z);
+    game.updateShadow(current.position);
+    game.ball.quaternion.identity();
+    snapCamera();
+  }
+
+  // El balón terminó el tiro (detenido o embocado): aplica las reglas del hoyo.
+  function handleStop(): void {
+    awaitingStop = false;
+    if (!session) return;
+    if (current.phase === 'holed') {
+      session.ballHoled();
+      notifyHole();
+      options.onHoleEvent?.({ kind: 'holed', strokes: session.state.strokes, par: session.config.par });
+      return;
+    }
+    const outcome = session.ballStopped(current.position);
+    notifyHole();
+    if (outcome.kind === 'ob') {
+      placeBall(outcome.returnTo.x, outcome.returnTo.z); // +1 golpe y se repite desde el último punto
+      options.onHoleEvent?.({ kind: 'ob' });
+    } else if (outcome.kind === 'water') {
+      aimAtCup();
+      notifyRelief();
+      options.onHoleEvent?.({ kind: 'water' });
+    }
+  }
+
+  // Las flechas mueven el balón mientras se elige la opción 3 (← →) o la 4 (↑ ↓) del agua.
+  function updateRelief(frameTime: number): void {
+    const relief = session?.relief;
+    if (!session || !relief) return;
+    const held = (...codes: string[]): number => (codes.some((code) => keys.has(code)) ? 1 : 0);
+    let delta = 0;
+    if (relief.option === 3) {
+      delta = (held('ArrowRight', 'KeyD') - held('ArrowLeft', 'KeyA')) * RELIEF_LATERAL_RATE * frameTime;
+    } else if (relief.option === 4) {
+      delta = (held('ArrowUp', 'KeyW') - held('ArrowDown', 'KeyS')) * RELIEF_BEHIND_RATE * frameTime;
+    }
+    if (delta !== 0) {
+      session.adjustRelief(delta);
+      notifyRelief();
+    }
+  }
+
+  function confirmRelief(): void {
+    const chosen = session?.relief;
+    if (!session || !chosen) return;
+    const result = session.confirmRelief(current.position);
+    if (!result.applied) return; // posición no válida: el menú lo indica
+    if (result.position) placeBall(result.position.x, result.position.z);
+    aimAtCup();
+    notifyRelief();
+    notifyHole();
+    options.onHoleEvent?.({ kind: 'relief', option: chosen.option, penalty: RELIEF_PENALTY[chosen.option] });
   }
 
   function cameraTargets(ball: Vec3): { position: THREE.Vector3; look: THREE.Vector3 } {
@@ -181,6 +296,7 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
     lastTime = now;
 
     updateAim(frameTime);
+    updateRelief(frameTime);
 
     accumulator += frameTime;
     while (accumulator >= FIXED_DT) {
@@ -188,6 +304,10 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
       current = stepBall(current, config, FIXED_DT);
       accumulator -= FIXED_DT;
       recordStep(previous, current);
+      if (awaitingStop) {
+        session?.trackStep(previous.position, current.position);
+        if (current.phase === 'stopped' || current.phase === 'holed') handleStop();
+      }
     }
 
     // Se interpola entre el estado anterior y el actual para un movimiento suave.
@@ -199,6 +319,7 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
     };
     game.ball.position.set(position.x, position.y, position.z);
     game.updateShadow(position);
+    options.onBallMove?.(position);
     spinBall(current.angularVelocity, frameTime);
     updateCamera(position, frameTime);
     updateAimPreview();
@@ -220,7 +341,8 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
     record.steps += 1;
     if (!record.landed) record.apexHeight = Math.max(record.apexHeight, heightAboveTerrain(after.position));
     const contact = isGroundContact(before, after, config.terrain);
-    if (record.steps % TRACE_EVERY_STEPS === 0 || contact || after.phase === 'stopped') {
+    const finished = after.phase === 'stopped' || after.phase === 'holed';
+    if (record.steps % TRACE_EVERY_STEPS === 0 || contact || finished) {
       record.trace.push({ ...after.position });
     }
 
@@ -234,13 +356,14 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
         trace: record.trace,
       });
     }
-    if (after.phase === 'stopped') {
+    if (finished) {
       game.setTrace(record.trace);
       record = null;
     }
   }
 
   function launch(initial: BallState): void {
+    awaitingStop = true;
     previous = initial;
     current = { ...initial, phase: 'flying' };
     accumulator = 0;
@@ -260,6 +383,14 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
     current = origin();
     previous = current;
     accumulator = 0;
+    awaitingStop = false;
+    session?.reset(current.position); // el hoyo vuelve a empezar: 0 golpes
+    if (session && shotType !== DEFAULT_SHOT_TYPE) {
+      shotType = DEFAULT_SHOT_TYPE; // y con el golpe Potente
+      options.onShotTypeChange?.(shotType);
+    }
+    notifyHole();
+    notifyRelief();
     game.ball.position.set(current.position.x, current.position.y, current.position.z);
     game.updateShadow(current.position);
     game.ball.quaternion.identity();
@@ -268,13 +399,16 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
 
   // Golpea desde donde está el balón con el rumbo del teclado y el contacto del selector.
   function shoot(power: number, accuracy: number): void {
-    if (isMoving()) return;
+    if (isMoving() || (session && !session.canShoot)) return;
     const input: ShotInput = {
+      shotType,
       headingDeg: aimHeadingDeg,
       power,
       accuracy,
       contact: options.getContact(),
     };
+    session?.registerShot(current.position); // cada golpe lanzado cuenta, desde donde está el balón
+    notifyHole();
     launch(computeShot(input, current.position));
   }
 
@@ -282,10 +416,28 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
     keys.add(event.code);
     if (event.repeat) return;
     if (event.code === 'KeyR') reset();
+    if (session?.state.status === 'holed' && (event.code === 'Enter' || event.code === 'NumpadEnter')) reset(); // jugar de nuevo
+    if (session?.relief) {
+      const option = RELIEF_KEYS[event.code];
+      if (option) {
+        session.selectRelief(option);
+        notifyRelief();
+      }
+      if (event.code === 'Enter' || event.code === 'NumpadEnter') confirmRelief();
+    }
+    if ((event.code === 'KeyQ' || event.code === 'KeyE') && !isMoving() && !session?.relief) {
+      const next = nextShotType(shotType, event.code === 'KeyE' ? 1 : -1);
+      if (next !== shotType) {
+        shotType = next;
+        options.onShotTypeChange?.(shotType);
+      }
+    }
   });
   window.addEventListener('keyup', (event) => keys.delete(event.code));
   window.addEventListener('blur', () => keys.clear());
 
+  startSession()?.reset(current.position);
+  notifyHole();
   snapCamera();
   requestAnimationFrame((now) => {
     lastTime = now;
@@ -300,20 +452,29 @@ export function createGameLoop(game: GameScene, options: GameLoopOptions): GameL
     get isBallMoving() {
       return isMoving();
     },
+    get shotType() {
+      return shotType;
+    },
+    get canShoot() {
+      return !isMoving() && (!session || session.canShoot);
+    },
     setBody(body) {
       config.body = body;
     },
     setWind(wind) {
       config.wind = wind;
     },
-    setTerrain(terrain) {
-      config.terrain = terrain;
+    setField(next) {
+      field = next;
+      config.terrain = next.terrain;
+      config.surfaceAt = next.surfaceAt;
+      config.cup = next.cup;
+      startSession();
       terrainVersion += 1;
-      game.setTerrain(terrain);
-      // El balón queda sobre el nuevo suelo; si ya no puede estar quieto, empieza a rodar.
-      previous = current = settleOnTerrain(current, config);
-      game.ball.position.set(current.position.x, current.position.y, current.position.z);
-      game.updateShadow(current.position);
+      game.setField(next);
+      aimHeadingDeg = next.tee.headingDeg;
+      options.onAimChange?.(aimHeadingDeg);
+      reset(); // el balón vuelve al tee del nuevo campo
     },
     launch,
     shoot,

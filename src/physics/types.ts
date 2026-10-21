@@ -3,7 +3,8 @@
 
 export type Vec3 = { x: number; y: number; z: number };
 
-export type BallPhase = 'idle' | 'flying' | 'rolling' | 'stopped';
+// 'holed': el balón quedó dentro de la copa (todo él bajo el plano del borde); ya no se mueve.
+export type BallPhase = 'idle' | 'flying' | 'rolling' | 'stopped' | 'holed';
 
 export interface BallState {
   position: Vec3; // m, centro del balón
@@ -28,13 +29,20 @@ export interface CelestialBody {
   airDensity: number; // kg/m³ en la superficie
 }
 
-export type SurfaceId = 'fairway' | 'rough' | 'sand';
+export type SurfaceId = 'fairway' | 'rough' | 'sand' | 'green' | 'water';
 
 export interface SurfaceType {
   id: SurfaceId;
   restitution: number; // e: fracción de velocidad normal que se conserva
   slidingFriction: number; // μ de Coulomb en el impacto
   rollingResistance: number; // μr: desaceleración al rodar = μr · g
+}
+
+// Copa: cilindro vertical hundido bajo el borde, en un terreno plano alrededor de su centro.
+export interface Cup {
+  position: { x: number; z: number };
+  radius: number; // m; 0.255 (diámetro 51 cm; reglamento: 50 a 52 cm)
+  depth: number; // m bajo el borde; 0.28 (reglamento: mínimo 28 cm)
 }
 
 export interface Wind {
@@ -48,7 +56,11 @@ export interface ContactPoint {
   y: number; // -1..1: negativo = bajo el centro (globo, backspin), positivo = sobre el centro (raso, topspin)
 }
 
+// Tipo de golpe: fija la velocidad máxima y la elevación (ver SHOT_TYPES en game/shot.ts).
+export type ShotTypeId = 'powerful' | 'long' | 'short' | 'putt';
+
 export interface ShotInput {
+  shotType: ShotTypeId; // elegido con Q/E
   headingDeg: number; // rumbo elegido con el teclado
   power: number; // 0..1, fijado con el 2º clic
   accuracy: number; // -1..1, fijado con el 3º clic; 0 = centro perfecto

@@ -1,10 +1,12 @@
 import * as THREE from 'three';
 import type { Terrain } from '../physics/types';
+import { distanceToPolyline, pointAlong, polylineLength, type Vec2 } from './geometry';
 import { FLAT_TERRAIN } from './terrain';
 
 // Escenografía puramente visual: sirve para orientarse al girar el rumbo. No tiene
 // efecto en la física (los árboles y demás no colisionan; los obstáculos son del SPEC 04).
-// Todo se asienta sobre la altura del terreno; `setTerrain` lo recoloca al cambiar de terreno.
+// Todo se asienta sobre la altura del terreno; `setTerrain` lo recoloca al cambiar de terreno
+// y `setField` reparte árboles, postes y bandera según el campo.
 
 export const HORIZON_COLOR = 0xcfe6f5;
 const ZENITH_COLOR = 0x4f9fe0;
@@ -22,11 +24,47 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-// Corredor de juego del campo de prueba: ahí no se plantan árboles.
-const inPlayCorridor = (x: number, z: number): boolean => Math.abs(x) < 60 && z < 100 && z > -340;
+// Cómo se reparte el paisaje alrededor del campo activo.
+export interface SceneryLayout {
+  // Corredor de juego: línea central y semiancho. Ahí no se plantan árboles; dos hileras
+  // los bordean a ROW_GAPS m del corredor.
+  corridor: { path: Vec2[]; halfWidth: number };
+  // Postes de distancia cada 50 m medidos sobre `path`, a `offset` m a cada lado.
+  markers: { path: Vec2[]; offset: number };
+  // Bandera alta lejana para orientarse (campo de prueba); null si el campo no la lleva.
+  landmarkPole: Vec2 | null;
+}
+
+// Campo de prueba del SPEC 01: corredor de 60 m a cada lado de x = 0, de z = 100 a -340.
+export const TEST_FIELD_LAYOUT: SceneryLayout = {
+  corridor: {
+    path: [
+      { x: 0, z: 100 },
+      { x: 0, z: -340 },
+    ],
+    halfWidth: 60,
+  },
+  markers: {
+    path: [
+      { x: 0, z: 0 },
+      { x: 0, z: -300 },
+    ],
+    offset: 50,
+  },
+  landmarkPole: { x: 105, z: -85 },
+};
+
+const ROW_GAPS = [4, 28]; // m entre el borde del corredor y cada hilera de árboles
+const ROW_SPACING = 9; // m entre árboles de una hilera
+const SCATTERED_TREES = 320;
+const SCATTER_CLEARANCE = 5; // m extra de separación del corredor para el bosque disperso
+const MAX_TREES = 1500;
+const MARKER_SPACING = 50; // m entre postes de distancia
+const MARKER_COUNT = 6;
 
 export interface Scenery {
   setTerrain(terrain: Terrain): void; // asienta árboles, casa, bandera y postes sobre el terreno
+  setField(layout: SceneryLayout, terrain: Terrain): void; // reparte el paisaje del campo y lo asienta
 }
 
 export function createScenery(scene: THREE.Scene): Scenery {
@@ -37,16 +75,31 @@ export function createScenery(scene: THREE.Scene): Scenery {
   addOuterGround(scene);
   addMountains(scene, rand, between);
   addClouds(scene, rand, between);
-  const settlers = [
-    addTrees(scene, rand, between),
-    addClubhouse(scene),
-    addFlagPole(scene, 105, -85),
-    addYardageMarkers(scene),
-  ];
+  const trees = addTrees(scene);
+  const clubhouse = addClubhouse(scene);
+  const pole = addFlagPole(scene);
+  const markers = addYardageMarkers(scene);
 
-  const setTerrain = (terrain: Terrain): void => settlers.forEach((settle) => settle(terrain));
-  setTerrain(FLAT_TERRAIN);
-  return { setTerrain };
+  let terrain: Terrain = FLAT_TERRAIN;
+  const settle = (): void => {
+    trees.settle(terrain);
+    clubhouse(terrain);
+    pole.settle(terrain);
+    markers.settle(terrain);
+  };
+  const setField = (layout: SceneryLayout, next: Terrain): void => {
+    trees.layout(layout);
+    pole.layout(layout.landmarkPole);
+    markers.layout(layout.markers);
+    terrain = next;
+    settle();
+  };
+  const setTerrain = (next: Terrain): void => {
+    terrain = next;
+    settle();
+  };
+  setField(TEST_FIELD_LAYOUT, FLAT_TERRAIN);
+  return { setTerrain, setField };
 }
 
 // Cielo con degradado: más claro en el horizonte, más azul arriba.
@@ -132,52 +185,74 @@ function addClouds(scene: THREE.Scene, rand: () => number, between: (a: number, 
   }
 }
 
-// Árboles instanciados: dos hileras a cada lado del campo y bosque disperso alrededor.
-function addTrees(
-  scene: THREE.Scene,
-  rand: () => number,
-  between: (a: number, b: number) => number,
-): (terrain: Terrain) => void {
-  const spots: Array<{ x: number; z: number; scale: number }> = [];
-
-  for (const side of [-1, 1]) {
-    for (const rowX of [64, 88]) {
-      for (let z = 80; z > -330; z -= 9) {
-        spots.push({ x: side * (rowX + between(-5, 5)), z: z + between(-3, 3), scale: between(0.9, 1.6) });
-      }
-    }
-  }
-  let scattered = 0;
-  while (scattered < 320) {
-    const angle = rand() * Math.PI * 2;
-    const distance = between(180, 900);
-    const x = Math.sin(angle) * distance;
-    const z = -Math.cos(angle) * distance;
-    if (inPlayCorridor(x, z)) continue;
-    spots.push({ x, z, scale: between(1, 2.2) });
-    scattered += 1;
-  }
+// Árboles instanciados: dos hileras a cada lado del corredor de juego y bosque disperso alrededor.
+// `layout` los vuelve a repartir (con una semilla fija: el mismo campo da siempre el mismo bosque);
+// `settle` los asienta sobre el terreno.
+function addTrees(scene: THREE.Scene): {
+  layout: (layout: SceneryLayout) => void;
+  settle: (terrain: Terrain) => void;
+} {
+  let spots: Array<{ x: number; z: number; scale: number }> = [];
 
   const trunk = new THREE.InstancedMesh(
     new THREE.CylinderGeometry(0.3, 0.45, 2.2, 6),
     new THREE.MeshLambertMaterial({ color: 0x5b3a1e }),
-    spots.length,
+    MAX_TREES,
   );
   const foliage = new THREE.InstancedMesh(
     new THREE.ConeGeometry(2.4, 7.5, 8),
     new THREE.MeshLambertMaterial({ color: 0xffffff }), // el color real va por instancia
-    spots.length,
+    MAX_TREES,
   );
-
-  const greens = [0x1f5a2a, 0x276b30, 0x2f7a35, 0x1b4d28];
-  spots.forEach((_, i) => foliage.setColorAt(i, new THREE.Color(greens[Math.floor(rand() * greens.length)])));
   trunk.castShadow = true;
   foliage.castShadow = true;
+  trunk.frustumCulled = false;
+  foliage.frustumCulled = false;
   scene.add(trunk, foliage);
+
+  const greens = [0x1f5a2a, 0x276b30, 0x2f7a35, 0x1b4d28];
+  const color = new THREE.Color();
+
+  function layout({ corridor }: SceneryLayout): void {
+    const rand = mulberry32(20261016);
+    const between = (min: number, max: number): number => min + rand() * (max - min);
+    const outsideCorridor = (x: number, z: number, extra = 0): boolean =>
+      distanceToPolyline(x, z, corridor.path) >= corridor.halfWidth + extra;
+
+    spots = [];
+    const length = polylineLength(corridor.path);
+    for (const side of [-1, 1]) {
+      for (const gap of ROW_GAPS) {
+        for (let d = 0; d <= length; d += ROW_SPACING) {
+          const { point, direction } = pointAlong(corridor.path, d + between(-3, 3));
+          const lateral = side * (corridor.halfWidth + gap + between(-5, 5));
+          const x = point.x - direction.z * lateral;
+          const z = point.z + direction.x * lateral;
+          if (outsideCorridor(x, z)) spots.push({ x, z, scale: between(0.9, 1.6) });
+        }
+      }
+    }
+    let scattered = 0;
+    while (scattered < SCATTERED_TREES) {
+      const angle = rand() * Math.PI * 2;
+      const distance = between(180, 900);
+      const x = Math.sin(angle) * distance;
+      const z = -Math.cos(angle) * distance;
+      if (!outsideCorridor(x, z, SCATTER_CLEARANCE)) continue;
+      spots.push({ x, z, scale: between(1, 2.2) });
+      scattered += 1;
+    }
+
+    spots = spots.slice(0, MAX_TREES);
+    trunk.count = spots.length;
+    foliage.count = spots.length;
+    spots.forEach((_, i) => foliage.setColorAt(i, color.setHex(greens[Math.floor(rand() * greens.length)])));
+    if (foliage.instanceColor) foliage.instanceColor.needsUpdate = true;
+  }
 
   // La base del tronco queda en heightAt(x, z).
   const matrix = new THREE.Matrix4();
-  return (terrain) => {
+  function settle(terrain: Terrain): void {
     spots.forEach((spot, i) => {
       const s = spot.scale;
       const base = terrain.heightAt(spot.x, spot.z);
@@ -196,9 +271,9 @@ function addTrees(
     });
     trunk.instanceMatrix.needsUpdate = true;
     foliage.instanceMatrix.needsUpdate = true;
-    trunk.computeBoundingSphere();
-    foliage.computeBoundingSphere();
-  };
+  }
+
+  return { layout, settle };
 }
 
 // Casa club: punto de referencia grande y reconocible, a la izquierda y adelante.
@@ -222,7 +297,8 @@ function addClubhouse(scene: THREE.Scene): (terrain: Terrain) => void {
   return (terrain) => house.position.set(-150, terrain.heightAt(-150, -40), -40);
 }
 
-function addFlagPole(scene: THREE.Scene, x: number, z: number): (terrain: Terrain) => void {
+// Bandera alta de referencia lejana. Sin posición (null) queda oculta.
+function addFlagPole(scene: THREE.Scene): { layout: (at: Vec2 | null) => void; settle: (terrain: Terrain) => void } {
   const group = new THREE.Group();
   const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 9, 6), new THREE.MeshLambertMaterial({ color: 0xffffff }));
   pole.position.y = 4.5;
@@ -233,16 +309,28 @@ function addFlagPole(scene: THREE.Scene, x: number, z: number): (terrain: Terrai
   flag.position.set(1.1, 8.2, 0);
   group.add(pole, flag);
   scene.add(group);
-  return (terrain) => group.position.set(x, terrain.heightAt(x, z), z);
+
+  let at: Vec2 | null = null;
+  return {
+    layout(next) {
+      at = next;
+      group.visible = next !== null;
+    },
+    settle(terrain) {
+      if (at) group.position.set(at.x, terrain.heightAt(at.x, at.z), at.z);
+    },
+  };
 }
 
-// Postes de distancia a los lados del campo, cada 50 m desde la salida hacia -z.
-function addYardageMarkers(scene: THREE.Scene): (terrain: Terrain) => void {
+// Postes de distancia a los lados de la línea de juego, cada 50 m desde la salida.
+function addYardageMarkers(scene: THREE.Scene): {
+  layout: (markers: SceneryLayout['markers']) => void;
+  settle: (terrain: Terrain) => void;
+} {
   const colors = [0xffffff, 0xffeb3b, 0xff9800, 0xe53935, 0x8e24aa, 0x1e88e5];
-  const markers: Array<{ group: THREE.Group; x: number; z: number }> = [];
+  const markers: Array<{ group: THREE.Group; side: number; index: number; x: number; z: number }> = [];
   for (const side of [-1, 1]) {
-    colors.forEach((color, i) => {
-      const distance = (i + 1) * 50;
+    colors.slice(0, MARKER_COUNT).forEach((color, i) => {
       const group = new THREE.Group();
       const post = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 2.2, 6), new THREE.MeshLambertMaterial({ color: 0xf5f5f5 }));
       post.position.y = 1.1;
@@ -251,8 +339,24 @@ function addYardageMarkers(scene: THREE.Scene): (terrain: Terrain) => void {
       cap.rotation.y = side * (Math.PI / 2);
       group.add(post, cap);
       scene.add(group);
-      markers.push({ group, x: side * 50, z: -distance });
+      markers.push({ group, side, index: i, x: 0, z: 0 });
     });
   }
-  return (terrain) => markers.forEach((m) => m.group.position.set(m.x, terrain.heightAt(m.x, m.z), m.z));
+
+  return {
+    layout({ path, offset }) {
+      const length = polylineLength(path);
+      for (const marker of markers) {
+        const distance = (marker.index + 1) * MARKER_SPACING;
+        marker.group.visible = distance <= length;
+        const { point, direction } = pointAlong(path, distance);
+        const lateral = marker.side * offset;
+        marker.x = point.x - direction.z * lateral;
+        marker.z = point.z + direction.x * lateral;
+      }
+    },
+    settle(terrain) {
+      for (const m of markers) m.group.position.set(m.x, terrain.heightAt(m.x, m.z), m.z);
+    },
+  };
 }

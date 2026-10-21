@@ -1,4 +1,5 @@
-import type { BallSpec, BallState, CelestialBody, SurfaceType, Terrain, Vec3, Wind } from './types';
+import { SURFACES } from './surfaces';
+import type { BallSpec, BallState, CelestialBody, Cup, SurfaceId, SurfaceType, Terrain, Vec3, Wind } from './types';
 
 // Paso de simulación fijo, integrado con RK4.
 export const FIXED_DT = 1 / 240; // s
@@ -7,8 +8,9 @@ export interface SimConfig {
   ball: BallSpec;
   body: CelestialBody;
   wind: Wind;
-  surfaceAt: (position: Vec3) => SurfaceType; // superficie bajo el balón
+  surfaceAt: (x: number, z: number) => SurfaceId; // superficie bajo el balón
   terrain: Terrain;
+  cup?: Cup; // sin copa no hay embocado (el campo de prueba no tiene)
 }
 
 // Estado que integra RK4. El spin se mantiene constante durante el vuelo.
@@ -28,6 +30,8 @@ const sub = (a: Vec3, b: Vec3): Vec3 => ({ x: a.x - b.x, y: a.y - b.y, z: a.z - 
 const scale = (a: Vec3, k: number): Vec3 => ({ x: a.x * k, y: a.y * k, z: a.z * k });
 
 const norm = (a: Vec3): number => Math.hypot(a.x, a.y, a.z);
+
+const surfaceOf = (config: SimConfig, position: Vec3): SurfaceType => SURFACES[config.surfaceAt(position.x, position.z)];
 const cross = (a: Vec3, b: Vec3): Vec3 => ({
   x: a.y * b.z - a.z * b.y,
   y: a.z * b.x - a.x * b.z,
@@ -251,7 +255,7 @@ export const TAKEOFF_THRESHOLD = 0.3; // m/s
 function stepRolling(state: BallState, config: SimConfig, dt: number): BallState {
   const { ball, body, terrain } = config;
   const n = terrain.normalAt(state.position.x, state.position.z);
-  const surface = config.surfaceAt(state.position);
+  const surface = surfaceOf(config, state.position);
   const resistance = surface.rollingResistance * body.gravity * n.y; // m/s², módulo
   const g = body.gravity;
   const slopeAccel = scale(
@@ -335,7 +339,7 @@ function stepFlying(state: BallState, config: SimConfig, dt: number): BallState 
   };
   const normal = config.terrain.normalAt(x, z);
   if (dot(contact.velocity, normal) >= 0) return { ...next, phase: 'flying' }; // ya se aleja de la superficie
-  const bounced = applyBounce(contact, config.surfaceAt(contact.position), config.ball, normal);
+  const bounced = applyBounce(contact, surfaceOf(config, contact.position), config.ball, normal);
 
   // El resto del paso se avanza con la velocidad posterior al rebote, sin bajar del terreno.
   const remaining = (1 - fraction) * dt;
@@ -355,7 +359,7 @@ function stepFlying(state: BallState, config: SimConfig, dt: number): BallState 
 // condición de reposo del balón: g·sinθ/(1+f) ≤ μr·g·cosθ  (tan θ ≤ μr·(1+f)).
 export function holdsOnSlope(position: Vec3, config: SimConfig): boolean {
   const n = config.terrain.normalAt(position.x, position.z);
-  const surface = config.surfaceAt(position);
+  const surface = surfaceOf(config, position);
   return Math.hypot(n.x, n.z) / (1 + config.ball.momentOfInertiaFactor) <= surface.rollingResistance * n.y;
 }
 
@@ -369,6 +373,8 @@ export function settleOnTerrain(state: BallState, config: SimConfig): BallState 
   const n = config.terrain.normalAt(x, z);
 
   switch (state.phase) {
+    case 'holed':
+      return state; // dentro de la copa: no se reasienta sobre el terreno
     case 'flying':
       return state.position.y >= rest ? state : { ...state, position: { x, y: rest, z } };
     case 'rolling': {
@@ -395,15 +401,109 @@ export function settleOnTerrain(state: BallState, config: SimConfig): BallState 
   }
 }
 
+// --- Copa ---
+//
+// La copa es un cilindro hundido en un terreno plano alrededor de su centro. Con d la
+// distancia horizontal del centro del balón al centro de la copa, R el radio de la copa y
+// r el del balón:
+//   d ≥ R          el suelo está bajo el balón: se usa el terreno normal.
+//   R − r < d < R  el balón se apoya en el aro (esfera sobre círculo): el centro queda a
+//                  sqrt(r² − (R − d)²) sobre el plano del borde y la normal de contacto
+//                  apunta hacia el hueco, así que lo empuja adentro.
+//   d ≤ R − r      no hay suelo: el balón cae; bajo el plano del borde choca con la pared.
+// El balón queda embocado (`holed`) cuando toda la esfera pasa bajo el plano del borde.
+// Saltar la copa a alta velocidad sale solo de esta geometría: no hay una regla de
+// velocidad aparte.
+
+const cupDistance = (position: Vec3, cup: Cup): number =>
+  Math.hypot(position.x - cup.position.x, position.z - cup.position.z);
+
+// Resuelve el contacto con el aro, la pared y el fondo de la copa para un balón en vuelo cuyo
+// centro quedó (tras integrar un paso libre) sobre el hueco (d < R).
+function resolveCup(next: BallState, config: SimConfig, cup: Cup): BallState {
+  const r = config.ball.radius;
+  const R = cup.radius;
+  const rimY = config.terrain.heightAt(cup.position.x, cup.position.z);
+  const surface = SURFACES[config.surfaceAt(cup.position.x, cup.position.z)];
+  let { position, velocity, angularVelocity } = next;
+
+  for (let pass = 0; pass < 3; pass++) {
+    const dx = position.x - cup.position.x;
+    const dz = position.z - cup.position.z;
+    const d = Math.hypot(dx, dz);
+    const ux = d > 1e-9 ? dx / d : 1; // radial hacia afuera
+    const uz = d > 1e-9 ? dz / d : 0;
+    const y = position.y - rimY; // altura del centro sobre el plano del borde
+
+    if (y < 0) {
+      // Dentro del cilindro: la pared mantiene el centro a R − r o menos del eje.
+      if (d > R - r) {
+        position = { x: cup.position.x + ux * (R - r), y: position.y, z: cup.position.z + uz * (R - r) };
+        const radialSpeed = velocity.x * ux + velocity.z * uz;
+        if (radialSpeed > 0) {
+          const k = (1 + surface.restitution) * radialSpeed;
+          velocity = { x: velocity.x - k * ux, y: velocity.y, z: velocity.z - k * uz };
+        }
+      }
+      if (y < -r) {
+        // Toda la esfera bajo el plano del borde: embocado. Queda en el fondo.
+        return {
+          position: { x: position.x, y: rimY - cup.depth + r, z: position.z },
+          velocity: { x: 0, y: 0, z: 0 },
+          angularVelocity: { x: 0, y: 0, z: 0 },
+          phase: 'holed',
+        };
+      }
+      break;
+    }
+
+    // Sobre el plano del borde: el aro (círculo de radio R) puede tocar la esfera.
+    const wx = dx - ux * R;
+    const wy = y;
+    const wz = dz - uz * R;
+    const distance = Math.hypot(wx, wy, wz);
+    if (distance >= r) break;
+    const normal: Vec3 = { x: wx / distance, y: wy / distance, z: wz / distance };
+    position = {
+      x: cup.position.x + ux * R + normal.x * r,
+      y: rimY + normal.y * r,
+      z: cup.position.z + uz * R + normal.z * r,
+    };
+    if (dot(velocity, normal) < 0) {
+      const bounced = applyBounce({ position, velocity, angularVelocity, phase: 'flying' }, surface, config.ball, normal);
+      velocity = bounced.velocity;
+      angularVelocity = bounced.angularVelocity;
+    }
+  }
+  return { position, velocity, angularVelocity, phase: 'flying' };
+}
+
+// Vuelo con copa: si el centro sigue sobre suelo (d ≥ R) rige el terreno normal; si pasa
+// sobre el hueco se integra el paso libre y se resuelve el contacto con la copa.
+function stepFlyingWithCup(state: BallState, config: SimConfig, cup: Cup, dt: number): BallState {
+  const free = stepFlight(state, config, dt);
+  if (cupDistance(free.position, cup) >= cup.radius) return stepFlying(state, config, dt);
+  return resolveCup(free, config, cup);
+}
+
+// Rodando con copa: al pasar el centro del balón el borde (d < R) no queda suelo debajo y
+// sigue en vuelo con su velocidad.
+function stepRollingWithCup(state: BallState, config: SimConfig, cup: Cup, dt: number): BallState {
+  const next = stepRolling(state, config, dt);
+  if (next.phase !== 'rolling' || cupDistance(next.position, cup) >= cup.radius) return next;
+  return resolveCup(stepFlight({ ...state, phase: 'flying' }, config, dt), config, cup);
+}
+
 // Un paso de simulación completo, según la fase del balón.
 export function stepBall(state: BallState, config: SimConfig, dt: number = FIXED_DT): BallState {
+  const { cup } = config;
   switch (state.phase) {
     case 'flying':
-      return stepFlying(state, config, dt);
+      return cup ? stepFlyingWithCup(state, config, cup, dt) : stepFlying(state, config, dt);
     case 'rolling':
-      return stepRolling(state, config, dt);
+      return cup ? stepRollingWithCup(state, config, cup, dt) : stepRolling(state, config, dt);
     default:
-      return state; // idle y stopped no se mueven
+      return state; // idle, stopped y holed no se mueven
   }
 }
 
@@ -432,7 +532,7 @@ export function simulateUntilStopped(initial: BallState, config: SimConfig, dt: 
   let bounces = 0;
   const trace: Vec3[] = [state.position];
 
-  while (state.phase !== 'stopped' && time < MAX_FLIGHT_TIME) {
+  while (state.phase !== 'stopped' && state.phase !== 'holed' && time < MAX_FLIGHT_TIME) {
     const next = stepBall(state, config, dt);
     if (isGroundContact(state, next, config.terrain)) bounces += 1;
     state = next;

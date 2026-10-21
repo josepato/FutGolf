@@ -11,9 +11,9 @@ import {
   type SimConfig,
 } from '../src/physics/simulation';
 import { SURFACES } from '../src/physics/surfaces';
-import type { BallState, SurfaceId, Terrain, Vec3 } from '../src/physics/types';
+import type { BallState, ShotInput, SurfaceId, Terrain, Vec3 } from '../src/physics/types';
 import { computeShot, previewTrajectory } from '../src/game/shot';
-import { surfaceTypeAt } from '../src/world/field';
+import { testFieldSurfaceAt } from '../src/world/field';
 import { FLAT_TERRAIN } from '../src/world/terrain';
 import { TEST_TERRAIN } from '../src/world/testTerrain';
 
@@ -39,7 +39,7 @@ function airlessOn(terrain: Terrain): SimConfig {
     ball: BALL_SPEC,
     body: { ...CELESTIAL_BODIES.earth, airDensity: 0 },
     wind: { speed: 0, headingDeg: 0 },
-    surfaceAt: () => SURFACES.fairway,
+    surfaceAt: () => 'fairway',
     terrain,
   };
 }
@@ -260,7 +260,7 @@ const F = BALL_SPEC.momentOfInertiaFactor;
 
 const onSurface = (terrain: Terrain, surface: SurfaceId): SimConfig => ({
   ...airlessOn(terrain),
-  surfaceAt: () => SURFACES[surface],
+  surfaceAt: () => surface,
 });
 
 // Balón rodando sin deslizar sobre `terrain` en (x, z) con velocidad tangente `velocity`.
@@ -516,13 +516,13 @@ describe('el mismo tiro con relieve y con campo plano', () => {
     ball: BALL_SPEC,
     body: CELESTIAL_BODIES.earth,
     wind: { speed: 0, headingDeg: 0 },
-    surfaceAt: surfaceTypeAt,
+    surfaceAt: testFieldSurfaceAt,
     terrain,
   });
   const tee: Vec3 = { x: 0, y: R, z: 0 };
 
   it('aterriza en lugares distintos', () => {
-    const shot = computeShot({ headingDeg: 20, power: 0.8, accuracy: 0, contact: { x: 0, y: -0.5 } }, tee);
+    const shot = computeShot({ shotType: 'powerful', headingDeg: -35, power: 1, accuracy: 0, contact: { x: 0, y: -0.5 } }, tee);
     const relief = simulateFlight(shot, configOn(TEST_TERRAIN)).landingPosition;
     const flat = simulateFlight(shot, configOn(FLAT_TERRAIN)).landingPosition;
     expect(Math.hypot(relief.x - flat.x, relief.z - flat.z)).toBeGreaterThan(0.5);
@@ -536,7 +536,7 @@ describe('el mismo tiro con relieve y con campo plano', () => {
     { headingDeg: 10, power: 1, contact: { x: 0, y: 0.5 } },
   ])('la vista previa coincide con el vuelo real a menos de 10 cm (%j)', (spec) => {
     const config = configOn(TEST_TERRAIN);
-    const input = { ...spec, accuracy: 0 };
+    const input: ShotInput = { ...spec, shotType: 'powerful', accuracy: 0 };
     const preview = previewTrajectory(input, tee, config);
     const real = simulateUntilStopped(computeShot(input, tee), config).trace;
     expect(preview.length).toBeGreaterThan(10);

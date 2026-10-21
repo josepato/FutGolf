@@ -1,8 +1,7 @@
 // Campo de prueba plano. El origen (0, 0, 0) es el punto de patada inicial.
 // El rumbo 0 apunta hacia -z. La superficie se decide solo por la coordenada z.
 
-import { SURFACES } from '../physics/surfaces';
-import type { SurfaceId, SurfaceType } from '../physics/types';
+import type { SurfaceId } from '../physics/types';
 
 export interface SurfaceBand {
   surface: SurfaceId;
@@ -30,7 +29,8 @@ export function surfaceAt(z: number): SurfaceId {
   return z > SURFACE_BANDS[0].zStart ? SURFACE_BANDS[0].surface : SURFACE_BANDS[SURFACE_BANDS.length - 1].surface;
 }
 
-// Superficie física (coeficientes) bajo una posición del campo.
-export function surfaceTypeAt(position: { z: number }): SurfaceType {
-  return SURFACES[surfaceAt(position.z)];
+// Superficie bajo un punto del campo de prueba: solo depende de z, la x se ignora.
+// Es la forma de `SimConfig.surfaceAt`.
+export function testFieldSurfaceAt(_x: number, z: number): SurfaceId {
+  return surfaceAt(z);
 }

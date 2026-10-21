@@ -1,4 +1,4 @@
-import { elevationDeg, MAX_SPIN } from '../game/shot';
+import { MAX_SPIN } from '../game/shot';
 import type { ContactPoint } from '../physics/types';
 
 const SIZE = 140; // px, lado del dibujo del balón
@@ -104,10 +104,9 @@ export function createContactSelector(parent: HTMLElement): ContactSelector {
     ctx.strokeStyle = '#fff';
     ctx.stroke();
 
-    const elevation = elevationDeg(contact.y).toFixed(1);
     const backspin = Math.round(-contact.y * MAX_SPIN);
     const sidespin = Math.round(contact.x * MAX_SPIN);
-    readout.textContent = `Elevación ${elevation}° · Backspin ${backspin} · Lateral ${sidespin}`;
+    readout.textContent = `Backspin ${backspin} · Lateral ${sidespin}`;
   }
 
   // Convierte la posición del puntero a ContactPoint, recortado al disco unitario.

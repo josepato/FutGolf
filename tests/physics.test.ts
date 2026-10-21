@@ -20,15 +20,12 @@ import {
   powerAt,
 } from '../src/ui/powerBar';
 import {
-  BASE_ELEVATION_DEG,
   MAX_ACCURACY_DEVIATION_DEG,
-  MAX_EXTRA_ELEVATION_DEG,
-  MAX_LAUNCH_SPEED,
   MAX_SPIN,
+  SHOT_TYPES,
   PREVIEW_LENGTH,
   PREVIEW_SPACING,
   computeShot,
-  elevationDeg,
   previewTrajectory,
   rightVector,
 } from '../src/game/shot';
@@ -37,7 +34,7 @@ import type { BallState, CelestialBodyId, ShotInput, SurfaceId, Vec3, Wind } fro
 const NO_WIND: Wind = { speed: 0, headingDeg: 0 };
 
 function configFor(bodyId: CelestialBodyId, wind: Wind = NO_WIND): SimConfig {
-  return { ball: BALL_SPEC, body: CELESTIAL_BODIES[bodyId], wind, surfaceAt: () => SURFACES.fairway, terrain: FLAT_TERRAIN };
+  return { ball: BALL_SPEC, body: CELESTIAL_BODIES[bodyId], wind, surfaceAt: () => 'fairway', terrain: FLAT_TERRAIN };
 }
 
 // Misma gravedad que el cuerpo dado pero sin atmósfera.
@@ -46,14 +43,14 @@ function airlessConfigFor(bodyId: CelestialBodyId, wind: Wind = NO_WIND): SimCon
     ball: BALL_SPEC,
     body: { ...CELESTIAL_BODIES[bodyId], airDensity: 0 },
     wind,
-    surfaceAt: () => SURFACES.fairway,
+    surfaceAt: () => 'fairway',
     terrain: FLAT_TERRAIN,
   };
 }
 
 // Campo uniforme de una sola superficie.
 function configOn(surface: SurfaceId, bodyId: CelestialBodyId = 'earth'): SimConfig {
-  return { ...configFor(bodyId), surfaceAt: () => SURFACES[surface] };
+  return { ...configFor(bodyId), surfaceAt: () => surface };
 }
 
 // Balón saliendo del origen con rumbo 0 (hacia -z) y elevación en grados.
@@ -315,6 +312,7 @@ describe('rodadura y detención', () => {
 describe('conversión de golpe a tiro', () => {
   const origin: Vec3 = { x: 0, y: BALL_SPEC.radius, z: 0 };
   const shot = (overrides: Partial<ShotInput> = {}): ShotInput => ({
+    shotType: 'powerful',
     headingDeg: 0,
     power: 1,
     accuracy: 0,
@@ -325,9 +323,9 @@ describe('conversión de golpe a tiro', () => {
   const headingOf = (v: Vec3): number => (Math.atan2(v.x, -v.z) * 180) / Math.PI;
   const elevationOf = (v: Vec3): number => (Math.atan2(v.y, Math.hypot(v.x, v.z)) * 180) / Math.PI;
 
-  it('poder 1.0 da una velocidad inicial de 35 m/s y poder 0.5 da la mitad', () => {
-    expect(speedOf(computeShot(shot(), origin).velocity)).toBeCloseTo(MAX_LAUNCH_SPEED, 9);
-    expect(speedOf(computeShot(shot({ power: 0.5 }), origin).velocity)).toBeCloseTo(MAX_LAUNCH_SPEED / 2, 9);
+  it('poder 1.0 da una velocidad inicial de 35 m/s con el golpe Potente y poder 0.5 da la mitad', () => {
+    expect(speedOf(computeShot(shot(), origin).velocity)).toBeCloseTo(35, 9);
+    expect(speedOf(computeShot(shot({ power: 0.5 }), origin).velocity)).toBeCloseTo(17.5, 9);
   });
 
   it('el rumbo 0 va hacia -z, el 90° hacia +x y el -90° hacia -x', () => {
@@ -347,13 +345,14 @@ describe('conversión de golpe a tiro', () => {
     expect(relativeError(turned.landingPosition.x, range * Math.sin(Math.PI / 6))).toBeLessThan(1e-6);
   });
 
-  it('la elevación crece al golpear más abajo y baja a 0° al golpear arriba', () => {
-    expect(elevationDeg(0)).toBeCloseTo(BASE_ELEVATION_DEG, 9);
-    expect(elevationDeg(-1)).toBeCloseTo(BASE_ELEVATION_DEG + MAX_EXTRA_ELEVATION_DEG, 9);
-    expect(elevationDeg(1)).toBeCloseTo(0, 9);
-    expect(elevationDeg(-0.5)).toBeGreaterThan(elevationDeg(0));
-    expect(elevationDeg(0.5)).toBeLessThan(elevationDeg(0));
-    expect(elevationOf(computeShot(shot({ contact: { x: 0, y: -1 } }), origin).velocity)).toBeCloseTo(40, 9);
+  it('la elevación la fija el tipo de golpe y no depende del punto de contacto', () => {
+    // Cambio respecto al SPEC 01: antes crecía al golpear más abajo; ahora solo manda el tipo.
+    for (const y of [-1, -0.5, 0, 0.5, 1]) {
+      expect(elevationOf(computeShot(shot({ contact: { x: 0, y } }), origin).velocity)).toBeCloseTo(
+        SHOT_TYPES.powerful.elevationDeg,
+        9,
+      );
+    }
   });
 
   it('golpear abajo da backspin, arriba topspin, y a los lados spin vertical', () => {
@@ -396,7 +395,7 @@ describe('conversión de golpe a tiro', () => {
 
   it('los valores fuera de rango se recortan', () => {
     const crazy = computeShot(shot({ power: 5, accuracy: 9, contact: { x: 9, y: -9 } }), origin);
-    expect(speedOf(crazy.velocity)).toBeCloseTo(MAX_LAUNCH_SPEED, 9);
+    expect(speedOf(crazy.velocity)).toBeCloseTo(SHOT_TYPES.powerful.maxSpeed, 9);
     expect(crazy.angularVelocity.y).toBeCloseTo(MAX_SPIN, 9);
   });
 });
@@ -483,6 +482,7 @@ describe('detección de contacto con el suelo', () => {
 describe('vista previa del golpe', () => {
   const origin: Vec3 = { x: 0, y: BALL_SPEC.radius, z: 0 };
   const perfect = (overrides: Partial<ShotInput> = {}): ShotInput => ({
+    shotType: 'powerful',
     headingDeg: 0,
     power: 1,
     accuracy: 0,
@@ -519,16 +519,18 @@ describe('vista previa del golpe', () => {
   });
 
   it('un tiro rasante sigue por el suelo (rebotes y rodadura) hasta cubrir el largo de la vista previa', () => {
-    const points = previewTrajectory(perfect({ contact: { x: 0, y: 0 }, power: 0.3 }), origin, configFor('earth'));
-    expect(pathLength(points)).toBeGreaterThan(PREVIEW_LENGTH * 0.9);
+    // El Putt sale rasante (elevación 0°): sigue por el suelo en vez de volar. A 7 m/s la
+    // vista previa se corta por su tope de 4 s (~23 m), antes de cubrir los 36 m.
+    const points = previewTrajectory(perfect({ shotType: 'putt', power: 1 }), origin, configFor('earth'));
+    expect(pathLength(points)).toBeGreaterThan(PREVIEW_LENGTH * 0.6);
     expect(Math.max(...points.map((p) => p.y))).toBeLessThan(1);
-    expect(points[points.length - 1].z).toBeLessThan(-PREVIEW_LENGTH * 0.8); // avanza hacia el rumbo
+    expect(points[points.length - 1].z).toBeLessThan(-PREVIEW_LENGTH * 0.6); // avanza hacia el rumbo
   });
 
-  it('un tiro con elevación casi cero (0.1°) tampoco se queda en un punto', () => {
-    const points = previewTrajectory(perfect({ contact: { x: 0, y: 1 } }), origin, configFor('earth'));
+  it('un tiro con elevación 0° y spin (aunque el Putt no tiene) tampoco se queda en un punto', () => {
+    const points = previewTrajectory(perfect({ shotType: 'putt', contact: { x: 0, y: 1 } }), origin, configFor('earth'));
     expect(points.length).toBeGreaterThan(10);
-    expect(pathLength(points)).toBeGreaterThan(PREVIEW_LENGTH * 0.9);
+    expect(pathLength(points)).toBeGreaterThan(PREVIEW_LENGTH * 0.6);
   });
 
   it('el cuerpo celeste y el viento cambian la vista previa', () => {

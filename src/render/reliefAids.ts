@@ -97,7 +97,7 @@ export interface ReliefArrows {
 
 // Flechas que apuntan hacia donde rodaría el balón (cuesta abajo), más largas y rojas
 // cuanto mayor la pendiente. Rejilla fija en el mundo, solo alrededor del balón.
-export function createReliefArrows(surfaceColorAt: (z: number) => number): ReliefArrows {
+export function createReliefArrows(surfaceColorAt: (x: number, z: number) => number): ReliefArrows {
   const material = new THREE.MeshBasicMaterial({
     transparent: true,
     opacity: 0.55,
@@ -140,7 +140,8 @@ export function createReliefArrows(surfaceColorAt: (z: number) => number): Relie
         down.set(0, -1, 0).addScaledVector(normal, normal.y).normalize();
         side.crossVectors(down, normal);
 
-        const t = Math.min(1, slope / ARROW_FULL_SLOPE_DEG);
+        // Raíz de la pendiente: las caídas suaves (1° a 3°, las del green) se distinguen entre sí aunque no lleguen a las fuertes.
+        const t = Math.sqrt(Math.min(1, slope / ARROW_FULL_SLOPE_DEG));
         const length = 0.5 + 0.8 * t;
         const width = 0.35 + 0.2 * t;
         matrix.makeBasis(down.clone().multiplyScalar(length), normal, side.clone().multiplyScalar(width));
@@ -150,7 +151,7 @@ export function createReliefArrows(surfaceColorAt: (z: number) => number): Relie
           z + n.z * ARROW_LIFT,
         );
         mesh.setMatrixAt(count, matrix);
-        mesh.setColorAt(count, arrowTone(surfaceColorAt(z), t, color));
+        mesh.setColorAt(count, arrowTone(surfaceColorAt(x, z), t, color));
         count += 1;
       }
     }

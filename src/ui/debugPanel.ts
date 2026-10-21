@@ -1,10 +1,12 @@
 import { CELESTIAL_BODIES, DEFAULT_BODY_ID } from '../physics/bodies';
 import type { CelestialBody, CelestialBodyId, Wind } from '../physics/types';
+import type { FieldId } from '../world/fields';
 
 export interface DebugPanelOptions {
   onBodyChange: (body: CelestialBody) => void;
   onWindChange: (wind: Wind) => void;
-  onTerrainChange: (relief: boolean) => void; // true = campo con relieve, false = campo plano
+  onFieldChange: (field: FieldId) => void; // Hoyo 1 o campo de prueba
+  onTerrainChange: (relief: boolean) => void; // campo de prueba: true = con relieve, false = plano
   onReliefAidsChange: (aids: { contours: boolean; arrows: boolean }) => void; // ayudas para leer el relieve
 }
 
@@ -14,9 +16,9 @@ export interface DebugPanel {
 
 const MAX_WIND_SPEED = 30; // m/s
 
-// Panel de depuración: cuerpo celeste (gravedad y densidad del aire), terreno
-// (relieve o plano, para comparar el mismo tiro) y viento constante (velocidad y
-// rumbo). Los cambios se aplican de inmediato.
+// Panel de depuración: cuerpo celeste (gravedad y densidad del aire), campo (Hoyo 1 o
+// campo de prueba), terreno del campo de prueba (relieve o plano, para comparar el mismo
+// tiro) y viento constante (velocidad y rumbo). Los cambios se aplican de inmediato.
 export function createDebugPanel(parent: HTMLElement, options: DebugPanelOptions): DebugPanel {
   const panel = document.createElement('div');
   panel.style.cssText = [
@@ -52,9 +54,23 @@ export function createDebugPanel(parent: HTMLElement, options: DebugPanelOptions
   const bodyInfo = document.createElement('div');
   bodyInfo.style.cssText = 'opacity:0.8;margin-bottom:6px';
 
-  // Terreno
+  // Campo
+  const fieldLabel = document.createElement('label');
+  fieldLabel.textContent = 'Campo';
+  fieldLabel.style.display = 'block';
+  const fieldSelect = document.createElement('select');
+  fieldSelect.style.cssText = 'width:100%;margin:2px 0 6px';
+  for (const [value, text] of [['hole1', 'Hoyo 1'], ['test', 'Campo de prueba']]) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = text;
+    fieldSelect.appendChild(option);
+  }
+  fieldSelect.value = 'hole1';
+
+  // Terreno (solo el campo de prueba: el Hoyo 1 trae su propio relieve)
   const terrainLabel = document.createElement('label');
-  terrainLabel.textContent = 'Terreno';
+  terrainLabel.textContent = 'Terreno del campo de prueba';
   terrainLabel.style.display = 'block';
   const terrainSelect = document.createElement('select');
   terrainSelect.style.cssText = 'width:100%;margin:2px 0 6px';
@@ -65,6 +81,7 @@ export function createDebugPanel(parent: HTMLElement, options: DebugPanelOptions
     terrainSelect.appendChild(option);
   }
   terrainSelect.value = 'relief';
+  terrainSelect.disabled = true; // arranca en el Hoyo 1
 
   // Ayudas para leer el relieve
   const contoursRow = checkboxRow('Curvas de nivel');
@@ -80,7 +97,7 @@ export function createDebugPanel(parent: HTMLElement, options: DebugPanelOptions
 
   const content = document.createElement('div');
   content.style.marginTop = '4px';
-  content.append(bodyLabel, bodySelect, bodyInfo, terrainLabel, terrainSelect, contoursRow.element, arrowsRow.element, speedRow.element, headingRow.element, note);
+  content.append(bodyLabel, bodySelect, bodyInfo, fieldLabel, fieldSelect, terrainLabel, terrainSelect, contoursRow.element, arrowsRow.element, speedRow.element, headingRow.element, note);
   panel.append(title, content);
   parent.appendChild(panel);
 
@@ -108,6 +125,11 @@ export function createDebugPanel(parent: HTMLElement, options: DebugPanelOptions
     refreshBodyInfo();
     options.onBodyChange(selectedBody());
     bodySelect.blur(); // para que las flechas y A/D sigan girando el rumbo
+  });
+  fieldSelect.addEventListener('change', () => {
+    terrainSelect.disabled = fieldSelect.value !== 'test';
+    options.onFieldChange(fieldSelect.value as FieldId);
+    fieldSelect.blur(); // para que las flechas y A/D sigan girando el rumbo
   });
   terrainSelect.addEventListener('change', () => {
     options.onTerrainChange(terrainSelect.value === 'relief');

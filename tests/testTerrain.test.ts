@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import { surfaceAt } from '../src/world/field';
 import { TEST_TERRAIN, TEST_TERRAIN_DEF } from '../src/world/testTerrain';
 import { buildTerrain } from '../src/world/terrain';
-import type { SurfaceId } from '../src/physics/types';
 
 const { bounds } = TEST_TERRAIN_DEF;
 const STEP = 1; // m, muestreo de las pruebas
@@ -28,10 +27,11 @@ describe('TEST_TERRAIN_DEF', () => {
   });
 
   it('la pendiente máxima por franja es 8° en fairway, 20° en rough y 10° en arena', () => {
-    const limit: Record<SurfaceId, number> = { fairway: 8, rough: 20, sand: 10 };
-    const worst: Record<SurfaceId, number> = { fairway: 0, rough: 0, sand: 0 };
+    type FieldSurface = 'fairway' | 'rough' | 'sand'; // las únicas que tiene el campo de prueba
+    const limit: Record<FieldSurface, number> = { fairway: 8, rough: 20, sand: 10 };
+    const worst: Record<FieldSurface, number> = { fairway: 0, rough: 0, sand: 0 };
     forEachPoint((x, z) => {
-      const surface = surfaceAt(z);
+      const surface = surfaceAt(z) as FieldSurface;
       worst[surface] = Math.max(worst[surface], TEST_TERRAIN.slopeDegAt(x, z));
     });
     for (const surface of ['fairway', 'rough', 'sand'] as const) {

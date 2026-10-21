@@ -1,10 +1,11 @@
 import * as THREE from 'three';
 import { BALL_SPEC } from '../physics/bodies';
-import type { SurfaceId, Terrain, TerrainBounds, Vec3 } from '../physics/types';
-import { FIELD_EXTENSION, FIELD_HALF_WIDTH, SURFACE_BANDS, surfaceAt } from '../world/field';
+import type { Cup, Terrain, TerrainBounds, Vec3 } from '../physics/types';
+import type { Field, FlatRect } from '../world/fields';
 import { createScenery, HORIZON_COLOR } from '../world/scenery';
-import { addContourLines, createReliefArrows } from './reliefAids';
 import { FLAT_TERRAIN } from '../world/terrain';
+import { addContourLines, createReliefArrows } from './reliefAids';
+import { surfaceMapFor, SURFACE_COLORS } from './surfaceTexture';
 
 const BALL_RADIUS = BALL_SPEC.radius;
 // Hacia el sol: bajo y lateral, para que las laderas se vean claras u oscuras según su
@@ -32,36 +33,30 @@ function createShadowTexture(): THREE.CanvasTexture {
   return new THREE.CanvasTexture(canvas);
 }
 
-const SURFACE_COLORS: Record<SurfaceId, number> = {
-  fairway: 0x3f9b3a,
-  rough: 0x2b6e2b,
-  sand: 0xdcc88a,
-};
-
+const FLAG_HEIGHT = 2.5; // m, bandera de la copa
 const GROUND_STEP = 2; // m entre vértices de la malla del terreno en pantalla
 // Zona que se dibuja con malla cuando el terreno no tiene límites (FLAT_TERRAIN).
 const DEFAULT_GROUND_BOUNDS: TerrainBounds = { minX: -200, maxX: 200, minZ: -360, maxZ: 120 };
 
 // Malla del terreno: un vértice cada GROUND_STEP m muestreado de `terrain`, con normales
-// suaves del propio terreno y color por superficie (según la franja de z).
+// suaves del propio terreno. El color por superficie va en una textura (paintSurfaceMap),
+// con coordenadas uv sobre los límites de la malla.
 function buildTerrainGeometry(terrain: Terrain, bounds: TerrainBounds): THREE.BufferGeometry {
   const nx = Math.floor((bounds.maxX - bounds.minX) / GROUND_STEP) + 1;
   const nz = Math.floor((bounds.maxZ - bounds.minZ) / GROUND_STEP) + 1;
   const positions = new Float32Array(nx * nz * 3);
   const normals = new Float32Array(nx * nz * 3);
-  const colors = new Float32Array(nx * nz * 3);
-  const color = new THREE.Color();
+  const uvs = new Float32Array(nx * nz * 2);
 
   for (let j = 0; j < nz; j++) {
     const z = bounds.minZ + j * GROUND_STEP;
-    color.setHex(SURFACE_COLORS[surfaceAt(z)]);
     for (let i = 0; i < nx; i++) {
       const x = bounds.minX + i * GROUND_STEP;
       const n = terrain.normalAt(x, z);
       const k = (j * nx + i) * 3;
       positions.set([x, terrain.heightAt(x, z), z], k);
       normals.set([n.x, n.y, n.z], k);
-      colors.set([color.r, color.g, color.b], k);
+      uvs.set([(x - bounds.minX) / (bounds.maxX - bounds.minX), (z - bounds.minZ) / (bounds.maxZ - bounds.minZ)], (j * nx + i) * 2);
     }
   }
 
@@ -82,7 +77,7 @@ function buildTerrainGeometry(terrain: Terrain, bounds: TerrainBounds): THREE.Bu
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
-  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
   geometry.setIndex(new THREE.BufferAttribute(indices, 1));
   return geometry;
 }
@@ -96,7 +91,8 @@ export interface GameScene {
   setTrace(points: Vec3[]): void; // traza del tiro anterior
   updateShadow(ballPosition: Vec3): void; // sombra del balón en el suelo; recentra sombras y flechas
   setReliefAids(aids: { contours: boolean; arrows: boolean }): void; // curvas de nivel y flechas de caída
-  setTerrain(terrain: Terrain): void; // dibuja el terreno (malla en bounds y planos planos fuera)
+  setReliefMarker(position: Vec3 | null, valid: boolean): void; // marca dónde quedará el balón al elegir cómo seguir tras el agua
+  setField(field: Field): void; // dibuja el campo: terreno, superficies, copa, bandera, caja del tee y paisaje
   render(): void;
 }
 
@@ -136,6 +132,7 @@ export function createScene(canvas: HTMLCanvasElement): GameScene {
   scene.fog = new THREE.Fog(HORIZON_COLOR, 600, 5000);
   const scenery = createScenery(scene);
   let terrain: Terrain = FLAT_TERRAIN; // el suelo vigente; la sombra se posa sobre él
+  let surfaceColorAt: (x: number, z: number) => number = () => SURFACE_COLORS.fairway;
 
   // Poca luz ambiente y mucho sol rasante: el contraste entre laderas es lo que da volumen.
   scene.add(new THREE.HemisphereLight(0xdfeeff, 0x3a5530, 0.6));
@@ -156,57 +153,168 @@ export function createScene(canvas: HTMLCanvasElement): GameScene {
   const sunOffset = SUN_DIRECTION.clone().normalize().multiplyScalar(250);
   sun.position.copy(sunOffset);
 
-  const reliefArrows = createReliefArrows((z) => SURFACE_COLORS[surfaceAt(z)]);
+  const reliefArrows = createReliefArrows((x, z) => surfaceColorAt(x, z));
   scene.add(reliefArrows.object);
   let contours = { enabled: { value: 1 } };
 
-  // Suelo: malla del terreno dentro de bounds y planos planos de borde fuera, con el
-  // color de la franja de superficie que les toca. La primera y la última franja se
-  // prolongan: la física las usa fuera del campo.
+  // Suelo: malla del terreno dentro de bounds con la textura de superficies, planos planos de
+  // borde fuera (los define el campo) y, sobre el terreno, la copa, la bandera y la caja del tee.
   const ground = new THREE.Group();
   scene.add(ground);
 
-  function addFlatRect(minX: number, maxX: number, minZ: number, maxZ: number, surface: SurfaceId): void {
-    if (maxX <= minX || maxZ <= minZ) return;
+  function addFlatRect(rect: FlatRect): void {
     const plane = new THREE.Mesh(
-      new THREE.PlaneGeometry(maxX - minX, maxZ - minZ),
-      new THREE.MeshLambertMaterial({ color: SURFACE_COLORS[surface] }),
+      new THREE.PlaneGeometry(rect.maxX - rect.minX, rect.maxZ - rect.minZ),
+      new THREE.MeshLambertMaterial({ color: SURFACE_COLORS[rect.surface] }),
     );
     plane.receiveShadow = true;
     plane.rotation.x = -Math.PI / 2;
-    plane.position.set((minX + maxX) / 2, 0, (minZ + maxZ) / 2);
+    plane.position.set((rect.minX + rect.maxX) / 2, 0, (rect.minZ + rect.maxZ) / 2);
     ground.add(plane);
   }
 
-  function setTerrain(next: Terrain): void {
-    terrain = next;
-    scenery.setTerrain(next);
-    reliefArrows.setTerrain(next);
-    for (const child of [...ground.children]) {
-      const mesh = child as THREE.Mesh;
-      mesh.geometry.dispose();
-      (mesh.material as THREE.Material).dispose();
-      ground.remove(mesh);
-    }
+  function surfaceTexture(field: Field, bounds: TerrainBounds): THREE.CanvasTexture {
+    const image = surfaceMapFor(field, bounds, field.surfaceAt, field.isOutOfBounds);
+    const canvas = document.createElement('canvas');
+    canvas.width = image.width;
+    canvas.height = image.height;
+    canvas.getContext('2d')!.putImageData(new ImageData(image.data, image.width, image.height), 0, 0);
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.flipY = false; // la fila 0 es z = bounds.minZ, igual que la v de la malla
+    texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    return texture;
+  }
 
-    const bounds = Number.isFinite(next.bounds.minX) ? next.bounds : DEFAULT_GROUND_BOUNDS;
-    const terrainMaterial = new THREE.MeshLambertMaterial({ vertexColors: true });
+  // Copa: disco oscuro con aro claro y bandera. Caja del tee: parche claro con borde blanco.
+  const props = new THREE.Group();
+  scene.add(props);
+
+  function addCup(cup: Cup): void {
+    const { x, z } = cup.position;
+    const y = terrain.heightAt(x, z);
+    const hole = new THREE.Mesh(
+      new THREE.CircleGeometry(cup.radius, 32),
+      new THREE.MeshBasicMaterial({ color: 0x050505, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 }),
+    );
+    hole.rotation.x = -Math.PI / 2;
+    hole.position.set(x, y + 0.02, z);
+    const rim = new THREE.Mesh(
+      new THREE.RingGeometry(cup.radius, cup.radius + 0.04, 32),
+      new THREE.MeshBasicMaterial({ color: 0xf2f2f2, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 }),
+    );
+    rim.rotation.x = -Math.PI / 2;
+    rim.position.set(x, y + 0.02, z);
+
+    const flag = new THREE.Group();
+    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.015, FLAG_HEIGHT, 8), new THREE.MeshLambertMaterial({ color: 0xffffff }));
+    pole.position.y = FLAG_HEIGHT / 2;
+    const cloth = new THREE.Shape();
+    cloth.moveTo(0, 0);
+    cloth.lineTo(0.6, 0.18);
+    cloth.lineTo(0, 0.36);
+    cloth.closePath();
+    const pennant = new THREE.Mesh(new THREE.ShapeGeometry(cloth), new THREE.MeshBasicMaterial({ color: 0xd32f2f, side: THREE.DoubleSide }));
+    pennant.position.set(0.015, FLAG_HEIGHT - 0.4, 0);
+    flag.add(pole, pennant);
+    flag.position.set(x, y, z);
+    props.add(hole, rim, flag);
+  }
+
+  function addTeeBox(field: Field): void {
+    if (!field.teeBox) return;
+    const { x, z } = field.tee;
+    const y = field.terrain.heightAt(x, z) + 0.03;
+    const { width, depth } = field.teeBox;
+    const patch = new THREE.Mesh(
+      new THREE.PlaneGeometry(width, depth),
+      new THREE.MeshLambertMaterial({ color: 0x6fcf6a, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 }),
+    );
+    patch.rotation.x = -Math.PI / 2;
+    patch.position.set(x, y, z);
+    const half = { x: width / 2, z: depth / 2 };
+    const border = new THREE.LineLoop(
+      new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(x - half.x, y + 0.01, z - half.z),
+        new THREE.Vector3(x + half.x, y + 0.01, z - half.z),
+        new THREE.Vector3(x + half.x, y + 0.01, z + half.z),
+        new THREE.Vector3(x - half.x, y + 0.01, z + half.z),
+      ]),
+      new THREE.LineBasicMaterial({ color: 0xffffff }),
+    );
+    props.add(patch, border);
+  }
+
+  // Lago: lámina de agua translúcida sobre la depresión, para que se lea como agua desde lejos.
+  function addWater(water: Field['waters'][number]): void {
+    const surface = new THREE.Mesh(
+      new THREE.CircleGeometry(1, 64),
+      new THREE.MeshLambertMaterial({
+        color: SURFACE_COLORS.water,
+        transparent: true,
+        opacity: 0.8,
+        depthWrite: false,
+      }),
+    );
+    surface.scale.set(water.radiusX, water.radiusZ, 1);
+    // El círculo está en el plano XY: se tumba y se gira para que sus ejes sean los de la elipse.
+    surface.rotation.order = 'YXZ';
+    surface.rotation.set(-Math.PI / 2, -((water.rotationDeg ?? 0) * Math.PI) / 180, 0);
+    surface.position.set(water.x, water.level, water.z);
+    props.add(surface);
+  }
+
+  function disposeChildren(group: THREE.Group): void {
+    for (const child of [...group.children]) {
+      const object = child as THREE.Mesh;
+      object.geometry?.dispose();
+      const materials = Array.isArray(object.material) ? object.material : [object.material];
+      for (const material of materials) {
+        (material as THREE.MeshLambertMaterial | undefined)?.map?.dispose();
+        material?.dispose();
+      }
+      group.remove(child);
+    }
+  }
+
+  function setField(field: Field): void {
+    terrain = field.terrain;
+    surfaceColorAt = (x, z) => SURFACE_COLORS[field.surfaceAt(x, z)];
+    scenery.setField(field.scenery, field.terrain);
+    reliefArrows.setTerrain(field.terrain);
+    disposeChildren(ground);
+    disposeChildren(props);
+
+    const bounds = Number.isFinite(field.terrain.bounds.minX) ? field.terrain.bounds : DEFAULT_GROUND_BOUNDS;
+    const terrainMaterial = new THREE.MeshLambertMaterial({ map: surfaceTexture(field, bounds) });
     const previousContours = contours.enabled.value;
     contours = addContourLines(terrainMaterial);
     contours.enabled.value = previousContours;
-    const terrainMesh = new THREE.Mesh(buildTerrainGeometry(next, bounds), terrainMaterial);
+    const terrainMesh = new THREE.Mesh(buildTerrainGeometry(field.terrain, bounds), terrainMaterial);
     terrainMesh.receiveShadow = true;
     terrainMesh.castShadow = true;
     ground.add(terrainMesh);
 
-    SURFACE_BANDS.forEach((band, index) => {
-      const zTop = index === 0 ? band.zStart + FIELD_EXTENSION : band.zStart;
-      const zBottom = index === SURFACE_BANDS.length - 1 ? band.zEnd - FIELD_EXTENSION : band.zEnd;
-      addFlatRect(-FIELD_HALF_WIDTH, bounds.minX, zBottom, zTop, band.surface); // a la izquierda
-      addFlatRect(bounds.maxX, FIELD_HALF_WIDTH, zBottom, zTop, band.surface); // a la derecha
-      addFlatRect(bounds.minX, bounds.maxX, Math.max(zBottom, bounds.maxZ), zTop, band.surface); // delante
-      addFlatRect(bounds.minX, bounds.maxX, zBottom, Math.min(zTop, bounds.minZ), band.surface); // detrás
-    });
+    for (const rect of field.surroundings(bounds)) addFlatRect(rect);
+    if (field.cup) addCup(field.cup);
+    field.waters.forEach(addWater);
+    addTeeBox(field); // el bucle de juego llama a updateShadow después: recentra sombra y flechas
+  }
+
+  // Marca de colocación del balón (procedimiento de agua): aro cian si vale y rojo si no.
+  const reliefMarker = new THREE.Mesh(
+    new THREE.RingGeometry(0.4, 0.6, 32),
+    new THREE.MeshBasicMaterial({ color: 0x00e5ff, polygonOffset: true, polygonOffsetFactor: -5, polygonOffsetUnits: -5 }),
+  );
+  reliefMarker.rotation.x = -Math.PI / 2;
+  reliefMarker.visible = false;
+  scene.add(reliefMarker);
+
+  function setReliefMarker(position: Vec3 | null, valid: boolean): void {
+    reliefMarker.visible = position !== null;
+    if (!position) return;
+    reliefMarker.position.set(position.x, terrain.heightAt(position.x, position.z) + 0.06, position.z);
+    (reliefMarker.material as THREE.MeshBasicMaterial).color.setHex(valid ? 0x00e5ff : 0xff3b30);
   }
 
   const ball = new THREE.Mesh(
@@ -368,7 +476,8 @@ export function createScene(canvas: HTMLCanvasElement): GameScene {
     setAimPreview,
     setTrace,
     updateShadow,
-    setTerrain,
+    setField,
+    setReliefMarker,
     setReliefAids(aids) {
       contours.enabled.value = aids.contours ? 1 : 0;
       reliefArrows.setVisible(aids.arrows);
